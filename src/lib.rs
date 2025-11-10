@@ -1,8 +1,7 @@
 use gpui::{
-    Entity, FocusHandle, ImageSource, InteractiveElement, KeyBinding, Pixels, RenderImage,
-    ScrollHandle, SharedString, StyledImage, size,
+    Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding, Pixels, RenderImage,
+    Resource, ScrollHandle, SharedString, StyledImage, size,
 };
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -23,8 +22,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
-use hayro_syntax::page::Page;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -33,6 +31,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub struct PdfTabData {
     path: PathBuf,
     pdf_data: Arc<Vec<u8>>,
+    scroll: Arc<Mutex<VirtualListScrollHandle>>,
 }
 impl tabs::TabData for PdfTabData {
     fn label(&self) -> SharedString {
@@ -44,89 +43,160 @@ impl tabs::TabData for PdfTabData {
     }
 }
 
+pub struct NoGpuiImageCache;
+impl gpui::ImageCache for NoGpuiImageCache {
+    fn load(
+        &mut self,
+        _resource: &Resource,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        None
+    }
+}
+
 struct ImageCacheMutableState {
     used: Vec<Option<Arc<RenderImage>>>,
     unused: Vec<Option<Arc<RenderImage>>>,
+    in_progress: Vec<bool>,
+    gc_counter: u32,
+}
+impl ImageCacheMutableState {
+    fn mark_as_used(&mut self, index: usize, data: Arc<RenderImage>) {
+        if self.used.len() <= index {
+            self.used.resize_with(index + 1, || None);
+        }
+        self.used[index] = Some(data);
+        self.set_in_progress(index, false);
+    }
+    fn set_in_progress(&mut self, index: usize, value: bool) {
+        if self.in_progress.len() <= index {
+            self.in_progress.resize(index + 1, false);
+        }
+        self.in_progress[index] = value;
+    }
 }
 struct ImageCache {
-    state: RefCell<ImageCacheMutableState>,
+    state: Mutex<ImageCacheMutableState>,
     render_settings: RenderSettings,
+    pdf: Option<Arc<Pdf>>,
 }
 impl ImageCache {
     pub fn new() -> Self {
         Self {
-            state: RefCell::new(ImageCacheMutableState {
+            state: Mutex::new(ImageCacheMutableState {
                 used: Vec::with_capacity(256),
                 unused: Vec::with_capacity(256),
+                in_progress: Vec::with_capacity(256),
+                gc_counter: 0,
             }),
             render_settings: RenderSettings {
                 x_scale: 1.,
                 y_scale: 1.,
                 ..Default::default()
             },
+            pdf: None,
         }
     }
-    pub fn clear(&self) {
-        let mut guard = self.state.borrow_mut();
-        guard.used.clear();
-        guard.unused.clear();
-    }
     pub fn gc(&self) {
-        let mut guard = self.state.borrow_mut();
+        let mut guard = self.state.lock().unwrap();
         let this = &mut *guard;
 
-        eprintln!("GC {}", this.used.len());
-
-        this.unused.clear();
-        std::mem::swap(&mut this.used, &mut this.unused);
+        let total_size = this.used.len() + this.unused.len();
+        this.gc_counter += 1;
+        if this.gc_counter >= 3 || total_size > 6 {
+            this.unused.clear();
+            std::mem::swap(&mut this.used, &mut this.unused);
+            this.gc_counter = 0;
+        }
     }
-    pub fn get_image(&self, index: usize, page: &Page, cx: &mut App) -> Option<Arc<RenderImage>> {
-        let mut guard = self.state.borrow_mut();
+    pub fn get_image(
+        self: &Arc<Self>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<PdfPages>,
+    ) -> Option<Arc<RenderImage>> {
+        let mut guard = self.state.lock().unwrap();
         if let Some(image) = guard.used.get(index).cloned().flatten() {
             eprintln!("Cache hit for page {index} (in used)");
             return Some(image);
-        }
-        let render_image =
-            if let Some(image) = guard.unused.get_mut(index).and_then(|slot| slot.take()) {
-                eprintln!("Cache hit for page {index} (in unused)");
-                image
-            } else {
-                eprintln!("Cache miss for page {index}");
+        } else if let Some(image) = guard.unused.get_mut(index).and_then(|slot| slot.take()) {
+            eprintln!("Cache hit for page {index} (in unused)");
+            guard.mark_as_used(index, image.clone());
+            Some(image)
+        } else {
+            eprintln!("Cache miss for page {index}");
+            if matches!(guard.in_progress.get(index), Some(true)) {
+                return None; // already rendering in background.
+            }
+            let Some(pdf) = self.pdf.clone() else {
+                return None;
+            };
+            guard.set_in_progress(index, true);
+            drop(guard);
+
+            let window = window.to_async(cx);
+            let this = self.clone();
+            let renderer = cx.svg_renderer();
+            let background = cx.background_spawn(async move {
                 let interpreter_settings = InterpreterSettings::default();
 
-                let pixmap = render(page, &interpreter_settings, &self.render_settings);
+                let pixmap = render(
+                    &pdf.pages()[index],
+                    &interpreter_settings,
+                    &this.render_settings,
+                );
                 let image = Image::from_bytes(ImageFormat::Png, pixmap.take_png());
 
                 // Code from: <gpui::ImageDecoder as Asset>::load
-                let renderer = cx.svg_renderer();
-                // TODO: log error
-                image.to_image_data(renderer).ok()?
-            };
+                let result = image.to_image_data(renderer);
+                {
+                    let mut guard = this.state.lock().unwrap();
+                    if let Ok(render_image) = result {
+                        guard.mark_as_used(index, render_image);
+                    } else {
+                        // TODO: log error
+                    }
+                    guard.set_in_progress(index, false);
+                }
+            });
+            let parent = cx.weak_entity();
+            window
+                .spawn(async move |window| {
+                    background.await;
 
-        // Cache it:
-        if guard.used.len() <= index {
-            guard.used.resize_with(index + 1, || None);
+                    if let Some(parent) = parent.upgrade() {
+                        _ = window.update_entity(&parent, |_view, cx: &mut Context<PdfPages>| {
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            None
         }
-        guard.used[index] = Some(render_image.clone());
-        Some(render_image)
     }
 }
 
 pub struct PdfPages {
     scroll_handle: VirtualListScrollHandle,
     scroll_state: ScrollbarState,
+    save_scroll: Arc<Mutex<VirtualListScrollHandle>>,
     item_sizes: Rc<Vec<Size<Pixels>>>,
-    images: Rc<ImageCache>,
-    pdf_data: Option<Arc<Pdf>>,
+    images: Arc<ImageCache>,
+    /// Used to bypass GPUI's inbuilt image cache.
+    disabled_cache: Entity<NoGpuiImageCache>,
 }
 impl PdfPages {
-    pub fn new(_window: &mut Window, _cx: &mut Context<Self>) -> Self {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             scroll_handle: VirtualListScrollHandle::from(ScrollHandle::default()),
             scroll_state: Default::default(),
+            save_scroll: Arc::new(Mutex::new(VirtualListScrollHandle::from(
+                ScrollHandle::new(),
+            ))),
             item_sizes: Rc::new(vec![]),
-            images: Rc::new(ImageCache::new()),
-            pdf_data: None,
+            images: Arc::new(ImageCache::new()),
+            disabled_cache: cx.new(|_cx| NoGpuiImageCache),
         }
     }
 }
@@ -141,25 +211,22 @@ impl Render for PdfPages {
                     cx.entity().clone(),
                     "pdf-viewer-pages-list",
                     self.item_sizes.clone(),
-                    |view, visible_range, window, _cx| {
+                    move |view, visible_range, window, cx| {
                         visible_range
                             .map(|row_ix| {
-                                let images = view.images.clone();
-                                let pdf = view.pdf_data.clone();
-                                let source =
-                                    ImageSource::from(move |_window: &mut Window, cx: &mut App| {
-                                        let pdf = pdf.as_ref()?;
-                                        Some(Ok(images.get_image(
-                                            row_ix,
-                                            &pdf.pages()[row_ix],
-                                            cx,
-                                        )?))
-                                    });
-                                img(source)
-                                    .object_fit(ObjectFit::ScaleDown)
-                                    .max_w(window.viewport_size().width)
-                                //.w(px(page.media_box().width() as f32))
-                                //.h(px(page.media_box().height() as f32))
+                                let page_image = view.images.get_image(row_ix, window, cx);
+                                if let Some(page_image) = page_image {
+                                    img(page_image)
+                                        .object_fit(ObjectFit::Cover)
+                                        .max_w(window.viewport_size().width)
+                                        .image_cache(&view.disabled_cache)
+                                        //.w(px(page.media_box().width() as f32))
+                                        //.h(px(page.media_box().height() as f32))
+                                        .into_any_element()
+                                } else {
+                                    //  Loading or errored
+                                    div().into_any_element()
+                                }
                             })
                             .collect()
                     },
@@ -179,6 +246,7 @@ impl Render for PdfPages {
                             .axis(ScrollbarAxis::Vertical),
                     ),
             )
+            .into_any_element()
     }
 }
 
@@ -216,18 +284,22 @@ impl PdfReader {
             pages: cx.new(|cx| PdfPages::new(window, cx)),
         }
     }
-    fn update_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn active_pdf_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pages.update(cx, |pages, cx| {
-            pages.images.clear();
-            pages.item_sizes = Rc::new(vec![]);
+            pages.item_sizes = Rc::new(vec![]); // forget page sizes
+            pages.images = Arc::new(ImageCache::new()); // clear cache
+
+            *pages.save_scroll.lock().unwrap() = pages.scroll_handle.clone(); // save scroll
+            pages.scroll_handle = VirtualListScrollHandle::from(ScrollHandle::default()); // reset scroll
+
             let Some(tab_data) = self.tabs.read(cx).active_tab_data() else {
                 return;
             };
+            pages.scroll_handle = tab_data.scroll.lock().unwrap().clone(); // restore scroll
             let Ok(pdf) = Pdf::new(tab_data.pdf_data.clone()) else {
                 return;
             };
             let pdf = Arc::new(pdf);
-            pages.pdf_data = Some(pdf.clone());
             if pdf.pages().is_empty() {
                 return;
             }
@@ -250,7 +322,8 @@ impl PdfReader {
 
             let mut cache = ImageCache::new();
             cache.render_settings = render_settings;
-            pages.images = Rc::new(cache);
+            cache.pdf = Some(pdf.clone());
+            pages.images = Arc::new(cache);
 
             pages.item_sizes = Rc::new(
                 pdf.pages()
@@ -338,12 +411,15 @@ impl Update<PdfCommand> for PdfReader {
                     *tab_data = Some(PdfTabData {
                         path,
                         pdf_data: Arc::new(pdf_data),
+                        scroll: Arc::new(Mutex::new(VirtualListScrollHandle::from(
+                            ScrollHandle::new(),
+                        ))),
                     });
                 }
-                self.update_images(window, cx);
+                self.active_pdf_changed(window, cx);
             }
             PdfCommand::ChangedTab => {
-                self.update_images(window, cx);
+                self.active_pdf_changed(window, cx);
             }
         }
     }
