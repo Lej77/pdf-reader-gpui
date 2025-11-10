@@ -1,6 +1,6 @@
 use gpui::{
-    Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding, Pixels, RenderImage,
-    Resource, ScrollHandle, SharedString, StyledImage, size,
+    AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
+    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, size,
 };
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,6 +23,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -212,6 +213,7 @@ impl Render for PdfPages {
                     "pdf-viewer-pages-list",
                     self.item_sizes.clone(),
                     move |view, visible_range, window, cx| {
+                        eprintln!("Render {visible_range:?}");
                         visible_range
                             .map(|row_ix| {
                                 let page_image = view.images.get_image(row_ix, window, cx);
@@ -254,6 +256,7 @@ pub struct PdfReader {
     focus_handle: FocusHandle,
     tabs: Entity<TabsView<PdfTabData>>,
     pages: Entity<PdfPages>,
+    assumed_viewport_size: Size<Pixels>,
 }
 impl PdfReader {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -282,6 +285,7 @@ impl PdfReader {
                 })
             },
             pages: cx.new(|cx| PdfPages::new(window, cx)),
+            assumed_viewport_size: Default::default(),
         }
     }
     fn active_pdf_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -304,6 +308,8 @@ impl PdfReader {
                 return;
             }
 
+            let viewport_size = window.viewport_size();
+
             // Scale to fit window width:
             let base_width = pdf
                 .pages()
@@ -311,7 +317,7 @@ impl PdfReader {
                 .map(|page| page.media_box().width() as f32)
                 .max_by(f32::total_cmp)
                 .expect("more than one page");
-            let viewport_width = f32::from(window.viewport_size().width);
+            let viewport_width = f32::from(viewport_size.width);
             let scale_x = viewport_width / base_width;
 
             let render_settings = RenderSettings {
@@ -320,11 +326,14 @@ impl PdfReader {
                 ..Default::default()
             };
 
+            // Update image rendering:
             let mut cache = ImageCache::new();
             cache.render_settings = render_settings;
             cache.pdf = Some(pdf.clone());
             pages.images = Arc::new(cache);
 
+            // Update layout/sizes:
+            self.assumed_viewport_size = viewport_size;
             pages.item_sizes = Rc::new(
                 pdf.pages()
                     .iter()
@@ -337,10 +346,49 @@ impl PdfReader {
             );
         });
     }
+    fn check_window_size(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let mut latest_window_size = window.viewport_size();
+        if self.assumed_viewport_size == Size::default() {
+            return; // resize already being monitored.
+        }
+        if latest_window_size == self.assumed_viewport_size {
+            return; // no resize
+        }
+        self.assumed_viewport_size = Size::default();
+        let this = cx.weak_entity();
+
+        window
+            .spawn(cx, async move |window: &mut AsyncWindowContext| {
+                loop {
+                    window
+                        .background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let keep_checking = window.update(|window, cx| {
+                        let new_size = window.viewport_size();
+                        if new_size != latest_window_size {
+                            // still resizing
+                            latest_window_size = new_size;
+                            true
+                        } else {
+                            _ = this.update(cx, |this, cx| {
+                                this.active_pdf_changed(window, cx);
+                            });
+                            false
+                        }
+                    });
+                    if !matches!(keep_checking, Ok(true)) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    }
 }
 const CONTEXT: &str = "pdf-reader";
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.check_window_size(window, cx);
         v_flex()
             .size_full()
             .id("pdf-reader")
