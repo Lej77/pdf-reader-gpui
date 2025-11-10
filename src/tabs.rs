@@ -43,10 +43,7 @@ impl<T> TabsView<T> {
             on_tab_changed: Box::new(|_window, _cx| {}),
         }
     }
-    pub fn on_tab_changed(
-        &mut self,
-        handler: impl Fn(&mut Window, &mut Context<Self>) + 'static,
-    ) {
+    pub fn on_tab_changed(&mut self, handler: impl Fn(&mut Window, &mut Context<Self>) + 'static) {
         self.on_tab_changed = Box::new(handler);
     }
 
@@ -58,7 +55,10 @@ impl<T> TabsView<T> {
     pub fn remove_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         match self.tabs.len() {
             0 => return,
-            1 => self.tabs[0] = None,
+            1 => {
+                self.tabs[0] = None;
+                (self.on_tab_changed)(window, cx);
+            }
             _ => {
                 self.tabs.remove(index);
                 if self.active_tab == index {

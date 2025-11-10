@@ -1,6 +1,6 @@
-use std::borrow::Cow;
 use gpui::{AssetSource, SharedString};
 use rust_embed::RustEmbed;
+use std::borrow::Cow;
 
 /// An asset source that loads assets from the `./assets` folder.
 #[derive(RustEmbed)]
