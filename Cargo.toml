@@ -25,7 +25,7 @@ rfd = "0.15.0" # File prompts
 raw-window-handle = "0.6.2" # Used to set parent for file prompts (freezes parent window while they are open)
 
 # PDF:
-mimalloc = { version = "0.1.48", optional = true } # Allocating a lot so this helps a little
+mimalloc = { version = "0.1.48", optional = true } # Allocating a lot so this helps a little (seems to cause higher RAM usage)
 hayro = "0.4.0"
 hayro-syntax = "0.4.0"
 hayro-interpret = "0.4.0"
