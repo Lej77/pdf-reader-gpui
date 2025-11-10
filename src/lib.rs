@@ -70,20 +70,33 @@ impl PdfReader {
             images: Vec::new(),
         }
     }
-    fn update_images(&mut self, cx: &mut Context<Self>) {
+    fn update_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.images.clear();
         let Some(tab_data) = self.tabs.read(cx).active_tab_data() else {
-            self.images = Vec::new();
             return;
         };
         let Ok(pdf) = Pdf::new(tab_data.pdf_data.clone()) else {
             return;
         };
+        if pdf.pages().is_empty() {
+            return;
+        }
 
         let interpreter_settings = InterpreterSettings::default();
 
+        // Scale to fit window width:
+        let base_width = pdf
+            .pages()
+            .iter()
+            .map(|page| page.media_box().width() as f32)
+            .max_by(f32::total_cmp)
+            .expect("more than one page");
+        let viewport_width = f32::from(window.viewport_size().width);
+        let scale_x = viewport_width / base_width;
+
         let render_settings = RenderSettings {
-            x_scale: 1.,
-            y_scale: 1.,
+            x_scale: scale_x,
+            y_scale: scale_x,
             ..Default::default()
         };
 
@@ -118,12 +131,15 @@ impl Render for PdfReader {
                             .max_w_full()
                             .items_center()
                             .justify_center()
-                            .children(
-                                self.images
-                                    .iter()
-                                    .cloned()
-                                    .map(|image| img(image).object_fit(ObjectFit::Contain)),
-                            )
+                            .children(self.images.iter().zip(pdf.pages().iter()).map(
+                                |(image, page)| {
+                                    img(image.clone())
+                                        .object_fit(ObjectFit::ScaleDown)
+                                        .w(px(page.media_box().width() as f32))
+                                        .max_w(window.viewport_size().width)
+                                        .h(px(page.media_box().height() as f32))
+                                },
+                            ))
                             .scrollable(Axis::Vertical)
                             .into_any_element(),
                         Err(e) => v_flex()
@@ -173,7 +189,7 @@ pub enum PdfCommand {
     ChangedTab,
 }
 impl Update<PdfCommand> for PdfReader {
-    fn update(&mut self, _window: &mut Window, cx: &mut Context<Self>, msg: PdfCommand) {
+    fn update(&mut self, window: &mut Window, cx: &mut Context<Self>, msg: PdfCommand) {
         match msg {
             PdfCommand::LoadedData(path, pdf_data) => {
                 if let Some(tab_data) = self.tabs.as_mut(cx).active_tab_data_mut() {
@@ -182,10 +198,10 @@ impl Update<PdfCommand> for PdfReader {
                         pdf_data: Arc::new(pdf_data),
                     });
                 }
-                self.update_images(cx);
+                self.update_images(window, cx);
             }
             PdfCommand::ChangedTab => {
-                self.update_images(cx);
+                self.update_images(window, cx);
             }
         }
     }
