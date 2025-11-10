@@ -1,4 +1,7 @@
-use gpui::{Axis, Entity, FocusHandle, InteractiveElement, KeyBinding, SharedString, StyledImage};
+use gpui::{
+    Entity, FocusHandle, InteractiveElement, KeyBinding, ScrollHandle, SharedString,
+    StatefulInteractiveElement, StyledImage,
+};
 use std::path::PathBuf;
 pub mod assets;
 pub mod elm;
@@ -14,6 +17,7 @@ use gpui::{
     ParentElement, Render, Size, Styled, Window, WindowOptions, div, img, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, v_flex};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
 use std::sync::Arc;
@@ -40,6 +44,8 @@ pub struct PdfReader {
     focus_handle: FocusHandle,
     tabs: Entity<TabsView<PdfTabData>>,
     images: Vec<Arc<Image>>,
+    scroll_state: ScrollbarState,
+    scroll_handle: ScrollHandle,
 }
 impl PdfReader {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -68,6 +74,8 @@ impl PdfReader {
                 })
             },
             images: Vec::new(),
+            scroll_state: Default::default(),
+            scroll_handle: Default::default(),
         }
     }
     fn update_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -126,21 +134,41 @@ impl Render for PdfReader {
             .child(
                 if let Some(tab_data) = self.tabs.read(cx).active_tab_data() {
                     match Pdf::new(tab_data.pdf_data.clone()) {
-                        Ok(pdf) => v_flex()
+                        Ok(pdf) => div()
+                            .relative()
                             .size_full()
-                            .max_w_full()
-                            .items_center()
-                            .justify_center()
-                            .children(self.images.iter().zip(pdf.pages().iter()).map(
-                                |(image, page)| {
-                                    img(image.clone())
-                                        .object_fit(ObjectFit::ScaleDown)
-                                        .w(px(page.media_box().width() as f32))
-                                        .max_w(window.viewport_size().width)
-                                        .h(px(page.media_box().height() as f32))
-                                },
-                            ))
-                            .scrollable(Axis::Vertical)
+                            .child(
+                                div()
+                                    .id("pdf-viewer-content")
+                                    .track_scroll(&self.scroll_handle)
+                                    .overflow_scroll()
+                                    .size_full()
+                                    .child(
+                                        v_flex()
+                                            .max_w_full()
+                                            .items_center()
+                                            .justify_center()
+                                            .children(
+                                                self.images.iter().zip(pdf.pages().iter()).map(
+                                                    |(image, _page)| {
+                                                        img(image.clone())
+                                                            .object_fit(ObjectFit::ScaleDown)
+                                                            .max_w(window.viewport_size().width)
+                                                            //.w(px(page.media_box().width() as f32))
+                                                            //.h(px(page.media_box().height() as f32))
+                                                    },
+                                                ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .child(Scrollbar::vertical(&self.scroll_state, &self.scroll_handle).axis(ScrollbarAxis::Vertical)))
                             .into_any_element(),
                         Err(e) => v_flex()
                             .size_full()
