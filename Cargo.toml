@@ -7,7 +7,7 @@ license = "Apache-2.0"
 repository = "https://github.com/Lej77/pdf-reader-gpui"
 
 [features]
-default = ["mimalloc"]
+default = []
 
 pdf-js = ["gpui-component/webview", "dep:wry"] # TODO: support PDF.js, maybe adapt code from https://github.com/dmanuel64/leptos-pdf
 mimalloc = ["dep:mimalloc"]
