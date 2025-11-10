@@ -24,8 +24,10 @@ rfd = "0.15.0" # File prompts
 raw-window-handle = "0.6.2" # Used to set parent for file prompts (freezes parent window while they are open)
 
 # PDF:
+mimalloc = { version = "0.1.48", optional = true } # Allocating a lot so this helps a little
 hayro = "0.4.0"
-mimalloc = { version = "0.1.48", optional = true }
+hayro-syntax = "0.4.0"
+hayro-interpret = "0.4.0"
 
 [build-dependencies]
 winresource = "0.1.20" # Embed version and executable icon on Windows

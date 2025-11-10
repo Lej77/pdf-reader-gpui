@@ -4666,6 +4666,8 @@ dependencies = [
  "gpui",
  "gpui-component",
  "hayro",
+ "hayro-interpret",
+ "hayro-syntax",
  "lb-wry",
  "mimalloc",
  "raw-window-handle",
