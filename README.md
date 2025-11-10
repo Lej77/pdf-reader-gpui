@@ -22,9 +22,9 @@ The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive
 ## Alternatives
 
 There are some other Rust projects that can be used to view PDF files:
-- [newinnovations/MView6: High-performance PDF and photo viewer built with Rust and GTK4](https://github.com/newinnovations/MView6?tab=readme-ov-file)
 - [vincent-uden/miro: A native pdf viewer for Windows and Linux (Wayland/X11) with configurable keybindings.](https://github.com/vincent-uden/miro)
 - [itsjunetime/tdf: A tui-based PDF viewer](https://github.com/itsjunetime/tdf)
+- [newinnovations/MView6: High-performance PDF and photo viewer built with Rust and GTK4](https://github.com/newinnovations/MView6?tab=readme-ov-file)
 
 ## License
 
