@@ -1,5 +1,3 @@
-use gpui::{Axis, Entity, FocusHandle, InteractiveElement, KeyBinding, SharedString, StyledImage};
-use std::path::PathBuf;
 pub mod assets;
 pub mod elm;
 pub mod prompt;
@@ -10,12 +8,16 @@ use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
 use gpui::{
-    App, AppContext, Application, Context, Image, ImageFormat, IntoElement, ObjectFit,
-    ParentElement, Render, Size, Styled, Window, WindowOptions, div, img, px,
+    App, AppContext, Application, Context, Image, ImageFormat, ImageSource, IntoElement, ObjectFit,
+    ParentElement, Render, RenderImage, Size, Styled, Window, WindowOptions, div, img, px,
 };
+use gpui::{Axis, Entity, FocusHandle, InteractiveElement, KeyBinding, SharedString, StyledImage};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Root, StyledExt, v_flex};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
+use hayro_syntax::page::Page;
+use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "mimalloc")]
@@ -36,10 +38,76 @@ impl tabs::TabData for PdfTabData {
     }
 }
 
+struct ImageCacheMutableState {
+    used: Vec<Option<Arc<RenderImage>>>,
+    unused: Vec<Option<Arc<RenderImage>>>,
+}
+struct ImageCache {
+    state: RefCell<ImageCacheMutableState>,
+    render_settings: RenderSettings,
+}
+impl ImageCache {
+    pub fn new() -> Self {
+        Self {
+            state: RefCell::new(ImageCacheMutableState {
+                used: Vec::with_capacity(256),
+                unused: Vec::with_capacity(256),
+            }),
+            render_settings: RenderSettings {
+                x_scale: 1.,
+                y_scale: 1.,
+                ..Default::default()
+            },
+        }
+    }
+    pub fn clear(&self) {
+        let mut guard = self.state.borrow_mut();
+        guard.used.clear();
+        guard.unused.clear();
+    }
+    pub fn gc(&self) {
+        let mut guard = self.state.borrow_mut();
+        eprintln!("GC {}", guard.used.len());
+        let this = &mut *guard;
+        this.unused.clear();
+        std::mem::swap(&mut this.used, &mut this.unused);
+    }
+    pub fn get_image(&self, index: usize, page: &Page, cx: &mut App) -> Option<Arc<RenderImage>> {
+        let mut guard = self.state.borrow_mut();
+        if let Some(image) = guard.used.get(index).cloned().flatten() {
+            eprintln!("Cache hit for page {index} (in used)");
+            return Some(image);
+        }
+        let render_image =
+            if let Some(image) = guard.unused.get_mut(index).and_then(|slot| slot.take()) {
+                eprintln!("Cache hit for page {index} (in unused)");
+                image
+            } else {
+                eprintln!("Cache miss for page {index}");
+                let interpreter_settings = InterpreterSettings::default();
+
+                let pixmap = render(page, &interpreter_settings, &self.render_settings);
+                let image = Image::from_bytes(ImageFormat::Png, pixmap.take_png());
+
+                // Code from: <gpui::ImageDecoder as Asset>::load
+                let renderer = cx.svg_renderer();
+                // TODO: log error
+                image.to_image_data(renderer).ok()?
+            };
+
+        // Cache it:
+        if guard.used.len() <= index {
+            guard.used.resize_with(index + 1, || None);
+        }
+        guard.used[index] = Some(render_image.clone());
+        Some(render_image)
+    }
+}
+
 pub struct PdfReader {
     focus_handle: FocusHandle,
     tabs: Entity<TabsView<PdfTabData>>,
-    images: Vec<Arc<Image>>,
+    images: Arc<ImageCache>,
 }
 impl PdfReader {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -67,35 +135,15 @@ impl PdfReader {
                     tabs
                 })
             },
-            images: Vec::new(),
+            images: Arc::new(ImageCache::new()),
         }
-    }
-    fn update_images(&mut self, cx: &mut Context<Self>) {
-        let Some(tab_data) = self.tabs.read(cx).active_tab_data() else {
-            self.images = Vec::new();
-            return;
-        };
-        let pdf = Pdf::new(tab_data.pdf_data.clone()).unwrap();
-
-        let interpreter_settings = InterpreterSettings::default();
-
-        let render_settings = RenderSettings {
-            x_scale: 1.,
-            y_scale: 1.,
-            ..Default::default()
-        };
-
-        self.images = pdf
-            .pages()
-            .iter()
-            .map(|page| render(page, &interpreter_settings, &render_settings).take_png())
-            .map(|png_data| Arc::new(Image::from_bytes(ImageFormat::Png, png_data)))
-            .collect();
     }
 }
 const CONTEXT: &str = "pdf-reader";
 impl Render for PdfReader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.images.gc();
+
         v_flex()
             .size_full()
             .id("pdf-reader")
@@ -108,51 +156,82 @@ impl Render for PdfReader {
             // Tab bar:
             .child(self.tabs.clone())
             // Content:
-            .child(if !self.images.is_empty() {
-                v_flex()
-                    .size_full()
-                    .max_w_full()
-                    .items_center()
-                    .justify_center()
-                    .children(
-                        self.images
-                            .iter()
-                            .cloned()
-                            .map(|image| img(image).object_fit(ObjectFit::Contain)),
-                    )
-                    .scrollable(Axis::Vertical)
-                    .into_any_element()
-            } else {
-                div()
-                    .v_flex()
-                    .gap_2()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Button::new("ok")
-                            .primary()
-                            .label("Select a PDF file")
-                            .on_click({
-                                let sender = MsgSender::from_cx(window, cx);
-                                move |_, window, _cx| {
-                                    let prompt =
-                                        prompt_load_pdf_file(Some(&NoDisplayHandle(window)));
-                                    sender
-                                        .spawn(async move |_window, mut sender| {
-                                            if let Some(data) = prompt.await {
-                                                sender.send(PdfCommand::LoadedData(
-                                                    data.path().to_owned(),
-                                                    data.read().await,
-                                                ))
-                                            }
-                                        })
-                                        .detach();
-                                }
-                            }),
-                    )
-                    .into_any_element()
-            })
+            .child(
+                if let Some(PdfTabData { pdf_data, .. }) = self.tabs.read(cx).active_tab_data() {
+                    match Pdf::new(pdf_data.clone()) {
+                        Ok(pdf) => v_flex()
+                            .size_full()
+                            .max_w_full()
+                            .items_center()
+                            .justify_center()
+                            .children({
+                                let pdf = Arc::new(pdf);
+                                pdf.pages()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, page)| {
+                                        let images = self.images.clone();
+                                        let pdf = pdf.clone();
+                                        let source = ImageSource::from(
+                                            move |_window: &mut Window, cx: &mut App| {
+                                                Some(Ok(images.get_image(
+                                                    index,
+                                                    &pdf.pages()[index],
+                                                    cx,
+                                                )?))
+                                            },
+                                        );
+                                        (source, page)
+                                    })
+                                    .map(|(image, page)| {
+                                        div()
+                                            .child(img(image).object_fit(ObjectFit::Contain))
+                                            .w(px(dbg!(page.media_box()).width() as f32))
+                                            .h(px(page.media_box().height() as f32))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .scrollable(Axis::Vertical)
+                            .into_any_element(),
+                        Err(e) => v_flex()
+                            .size_full()
+                            .items_center()
+                            .justify_center()
+                            .child(format!("Failed to load PDF:\n{e:?}"))
+                            .into_any_element(),
+                    }
+                } else {
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Button::new("ok")
+                                .primary()
+                                .label("Select a PDF file")
+                                .on_click({
+                                    let sender = MsgSender::from_cx(window, cx);
+                                    move |_, window, _cx| {
+                                        let prompt =
+                                            prompt_load_pdf_file(Some(&NoDisplayHandle(window)));
+                                        sender
+                                            .spawn(async move |_window, mut sender| {
+                                                if let Some(data) = prompt.await {
+                                                    sender.send(PdfCommand::LoadedData(
+                                                        data.path().to_owned(),
+                                                        data.read().await,
+                                                    ))
+                                                }
+                                            })
+                                            .detach();
+                                    }
+                                }),
+                        )
+                        .into_any_element()
+                },
+            )
     }
 }
 
@@ -170,10 +249,10 @@ impl Update<PdfCommand> for PdfReader {
                         pdf_data: Arc::new(pdf_data),
                     });
                 }
-                self.update_images(cx);
+                self.images.clear();
             }
             PdfCommand::ChangedTab => {
-                self.update_images(cx);
+                self.images.clear();
             }
         }
     }
