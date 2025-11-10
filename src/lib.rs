@@ -75,7 +75,9 @@ impl PdfReader {
             self.images = Vec::new();
             return;
         };
-        let pdf = Pdf::new(tab_data.pdf_data.clone()).unwrap();
+        let Ok(pdf) = Pdf::new(tab_data.pdf_data.clone()) else {
+            return;
+        };
 
         let interpreter_settings = InterpreterSettings::default();
 
@@ -108,51 +110,61 @@ impl Render for PdfReader {
             // Tab bar:
             .child(self.tabs.clone())
             // Content:
-            .child(if !self.images.is_empty() {
-                v_flex()
-                    .size_full()
-                    .max_w_full()
-                    .items_center()
-                    .justify_center()
-                    .children(
-                        self.images
-                            .iter()
-                            .cloned()
-                            .map(|image| img(image).object_fit(ObjectFit::Contain)),
-                    )
-                    .scrollable(Axis::Vertical)
-                    .into_any_element()
-            } else {
-                div()
-                    .v_flex()
-                    .gap_2()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Button::new("ok")
-                            .primary()
-                            .label("Select a PDF file")
-                            .on_click({
-                                let sender = MsgSender::from_cx(window, cx);
-                                move |_, window, _cx| {
-                                    let prompt =
-                                        prompt_load_pdf_file(Some(&NoDisplayHandle(window)));
-                                    sender
-                                        .spawn(async move |_window, mut sender| {
-                                            if let Some(data) = prompt.await {
-                                                sender.send(PdfCommand::LoadedData(
-                                                    data.path().to_owned(),
-                                                    data.read().await,
-                                                ))
-                                            }
-                                        })
-                                        .detach();
-                                }
-                            }),
-                    )
-                    .into_any_element()
-            })
+            .child(
+                if let Some(tab_data) = self.tabs.read(cx).active_tab_data() {
+                    match Pdf::new(tab_data.pdf_data.clone()) {
+                        Ok(pdf) => v_flex()
+                            .size_full()
+                            .max_w_full()
+                            .items_center()
+                            .justify_center()
+                            .children(
+                                self.images
+                                    .iter()
+                                    .cloned()
+                                    .map(|image| img(image).object_fit(ObjectFit::Contain)),
+                            )
+                            .scrollable(Axis::Vertical)
+                            .into_any_element(),
+                        Err(e) => v_flex()
+                            .size_full()
+                            .items_center()
+                            .justify_center()
+                            .child(format!("Failed to load PDF:\n{e:?}"))
+                            .into_any_element(),
+                    }
+                } else {
+                    div()
+                        .v_flex()
+                        .gap_2()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Button::new("ok")
+                                .primary()
+                                .label("Select a PDF file")
+                                .on_click({
+                                    let sender = MsgSender::from_cx(window, cx);
+                                    move |_, window, _cx| {
+                                        let prompt =
+                                            prompt_load_pdf_file(Some(&NoDisplayHandle(window)));
+                                        sender
+                                            .spawn(async move |_window, mut sender| {
+                                                if let Some(data) = prompt.await {
+                                                    sender.send(PdfCommand::LoadedData(
+                                                        data.path().to_owned(),
+                                                        data.read().await,
+                                                    ))
+                                                }
+                                            })
+                                            .detach();
+                                    }
+                                }),
+                        )
+                        .into_any_element()
+                },
+            )
     }
 }
 
