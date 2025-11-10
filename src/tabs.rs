@@ -137,16 +137,24 @@ impl<T: TabData> Render for TabsView<T> {
                 ..Default::default()
             })
             .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
-                match event.delta.pixel_delta(px(4.0)).y.cmp(&px(0.)) {
-                    Ordering::Less => {
-                        view.set_active_tab(view.active_tab.saturating_sub(1), window, cx);
-                        view.scroll_to_active_tab();
+                if event.control {
+                    match event.delta.pixel_delta(px(4.0)).y.cmp(&px(0.)) {
+                        Ordering::Less => {
+                            view.set_active_tab(view.active_tab.saturating_sub(1), window, cx);
+                            view.scroll_to_active_tab();
+                        }
+                        Ordering::Equal => {}
+                        Ordering::Greater => {
+                            view.set_active_tab(view.active_tab.saturating_add(1), window, cx);
+                            view.scroll_to_active_tab();
+                        }
                     }
-                    Ordering::Equal => {}
-                    Ordering::Greater => {
-                        view.set_active_tab(view.active_tab.saturating_add(1), window, cx);
-                        view.scroll_to_active_tab();
-                    }
+                } else {
+                    let mut new_offset =
+                        view.scroll_handle.offset() + event.delta.pixel_delta(px(4.));
+                    new_offset.x = new_offset.x.min(view.scroll_handle.max_offset().width);
+                    new_offset.y = new_offset.y.min(view.scroll_handle.max_offset().height);
+                    view.scroll_handle.set_offset(new_offset);
                 }
             }))
             .child(if self.tabs.is_empty() {
