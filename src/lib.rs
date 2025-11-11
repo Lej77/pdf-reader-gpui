@@ -15,13 +15,14 @@ use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
 use gpui::{
-    App, AppContext, Application, Context, Image, ImageFormat, IntoElement, ObjectFit,
-    ParentElement, Render, Size, Styled, Window, WindowOptions, div, img, px,
+    App, AppContext, Application, Context, IntoElement, ObjectFit, ParentElement, Render, Size,
+    Styled, Window, WindowOptions, div, img, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
+use image::{Frame, RgbaImage};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -111,6 +112,7 @@ impl ImageCache {
             this.gc_counter = 0;
         }
     }
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn get_image(
         self: &Arc<Self>,
         index: usize,
@@ -138,26 +140,37 @@ impl ImageCache {
 
             let window = window.to_async(cx);
             let this = self.clone();
-            let renderer = cx.svg_renderer();
             let background = cx.background_spawn(async move {
-                let interpreter_settings = InterpreterSettings::default();
+                let generate_image = || {
+                    let interpreter_settings = InterpreterSettings::default();
 
-                let pixmap = render(
-                    &pdf.pages()[index],
-                    &interpreter_settings,
-                    &this.render_settings,
-                );
-                let image = Image::from_bytes(ImageFormat::Png, pixmap.take_png());
+                    let pixmap = render(
+                        &pdf.pages()[index],
+                        &interpreter_settings,
+                        &this.render_settings,
+                    );
+                    // Code from: <gpui::ImageDecoder as Asset>::load
+                    // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
 
-                // Code from: <gpui::ImageDecoder as Asset>::load
-                let result = image.to_image_data(renderer);
+                    let width = u32::from(pixmap.width());
+                    let height = u32::from(pixmap.height());
+                    let mut data = pixmap.take_u8();
+                    // Convert from RGBA to BGRA.
+                    for pixel in data.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                    let image_data = RgbaImage::from_raw(width, height, data).unwrap();
+                    Arc::new(RenderImage::new([Frame::new(image_data)]))
+                };
+
+                #[cfg(feature = "hotpath")]
+                let render_image = hotpath::measure_block!("generate_image", generate_image());
+                #[cfg(not(feature = "hotpath"))]
+                let render_image = generate_image();
+
                 {
                     let mut guard = this.state.lock().unwrap();
-                    if let Ok(render_image) = result {
-                        guard.mark_as_used(index, render_image);
-                    } else {
-                        // TODO: log error
-                    }
+                    guard.mark_as_used(index, render_image);
                     guard.set_in_progress(index, false);
                 }
             });
@@ -188,6 +201,7 @@ pub struct PdfPages {
     disabled_cache: Entity<NoGpuiImageCache>,
 }
 impl PdfPages {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             scroll_handle: VirtualListScrollHandle::from(ScrollHandle::default()),
@@ -202,6 +216,7 @@ impl PdfPages {
     }
 }
 impl Render for PdfPages {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.images.gc();
         div()
@@ -288,6 +303,8 @@ impl PdfReader {
             assumed_viewport_size: Default::default(),
         }
     }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn active_pdf_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pages.update(cx, |pages, cx| {
             pages.item_sizes = Rc::new(vec![]); // forget page sizes
@@ -473,6 +490,7 @@ impl Update<PdfCommand> for PdfReader {
     }
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::main)]
 pub fn start_gui() {
     // let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     // let _rt_guard = rt.enter();

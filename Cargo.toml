@@ -12,6 +12,12 @@ default = []
 pdf-js = ["gpui-component/webview", "dep:wry"] # TODO: support PDF.js, maybe adapt code from https://github.com/dmanuel64/leptos-pdf
 mimalloc = ["dep:mimalloc"]
 
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc-bytes-total = ["hotpath/hotpath-alloc-bytes-total"]
+hotpath-alloc-count-total = ["hotpath/hotpath-alloc-count-total"]
+hotpath-alloc-self = ["hotpath/hotpath-alloc-self"]
+hotpath-off = ["hotpath/hotpath-off"]
+
 [dependencies]
 # GUI framework:
 gpui = "0.2.2" # GUI Core
@@ -19,16 +25,20 @@ gpui-component = { version = "0.3.0" } # GUI Components
 wry = { version = "0.53.3", package = "lb-wry", optional = true } # Web view
 rust-embed = { version = "8", features = ["interpolate-folder-path"] } # Include icon assets
 anyhow = "1" # Used by Assets trait in gpui-component
+image = "0.25.8" # Used to convert rendered PDF to format used by GPUI 
 
 # File prompts:
 rfd = "0.15.0" # File prompts
 raw-window-handle = "0.6.2" # Used to set parent for file prompts (freezes parent window while they are open)
 
 # PDF:
-mimalloc = { version = "0.1.48", optional = true } # Allocating a lot so this helps a little (seems to cause higher RAM usage)
 hayro = "0.4.0"
 hayro-syntax = "0.4.0"
 hayro-interpret = "0.4.0"
+
+# Performance
+mimalloc = { version = "0.1.48", optional = true } # Allocating a lot so this helps a little (seems to cause higher RAM usage)
+hotpath = { version = "0.5", optional = true }
 
 [build-dependencies]
 winresource = "0.1.20" # Embed version and executable icon on Windows
