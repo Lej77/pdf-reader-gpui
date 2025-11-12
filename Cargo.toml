@@ -25,7 +25,11 @@ gpui-component = { version = "0.3.0" } # GUI Components
 wry = { version = "0.53.3", package = "lb-wry", optional = true } # Web view
 rust-embed = { version = "8", features = ["interpolate-folder-path"] } # Include icon assets
 anyhow = "1" # Used by Assets trait in gpui-component
-image = "0.25.8" # Used to convert rendered PDF to format used by GPUI 
+image = "0.25.8" # Used to convert rendered PDF to format used by GPUI
+
+# Logging
+log = {  version = "0.4", features = ["release_max_level_off"] }
+env_logger = "0.11"
 
 # File prompts:
 rfd = "0.15.0" # File prompts

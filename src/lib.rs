@@ -1,8 +1,10 @@
 use gpui::{
     AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
-    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, size,
+    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, Task, WeakEntity, size,
 };
+use std::ops::Range;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
 
 pub mod assets;
@@ -22,13 +24,79 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
+use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// This type is the same as [`RenderSettings`] except it implements more traits.
+#[derive(Clone, Copy, PartialEq)]
+pub struct RenderSettings2 {
+    /// How much the contents should be scaled into the x direction.
+    pub x_scale: f32,
+    /// How much the contents should be scaled into the y direction.
+    pub y_scale: f32,
+    /// The width of the viewport. If this is set to `None`, the width will be chosen
+    /// automatically based on the scale factor and the dimensions of the PDF.
+    pub width: Option<u16>,
+    /// The height of the viewport. If this is set to `None`, the height will be chosen
+    /// automatically based on the scale factor and the dimensions of the PDF.
+    pub height: Option<u16>,
+}
+impl Default for RenderSettings2 {
+    fn default() -> Self {
+        RenderSettings::default().into()
+    }
+}
+impl From<RenderSettings> for RenderSettings2 {
+    fn from(value: RenderSettings) -> RenderSettings2 {
+        <RenderSettings2 as From<&'_ RenderSettings>>::from(&value)
+    }
+}
+impl From<&'_ RenderSettings> for RenderSettings2 {
+    fn from(value: &RenderSettings) -> Self {
+        Self {
+            x_scale: value.x_scale,
+            y_scale: value.y_scale,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+impl From<RenderSettings2> for RenderSettings {
+    fn from(value: RenderSettings2) -> Self {
+        Self {
+            x_scale: value.x_scale,
+            y_scale: value.y_scale,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+
+/// `true` if both ranges overlap or share an edge.
+pub fn range_is_contiguous(a: Range<usize>, b: Range<usize>) -> bool {
+    range_union(a.clone(), b.clone()).len() <= a.len() + b.len()
+}
+/// Get the smallest range that contains both `a` and `b`.
+pub fn range_union(a: Range<usize>, b: Range<usize>) -> Range<usize> {
+    match (a.len(), b.len()) {
+        (0, 0) => 0..0,
+        (_, 0) => a,
+        (0, _) => b,
+        _ => a.start.min(b.start)..a.end.max(b.end),
+    }
+}
+/// Get the largest range that is covered by both `a` and `b`.
+pub fn range_intersection(a: Range<usize>, b: Range<usize>) -> Range<usize> {
+    let start = a.start.max(b.start);
+    start..a.end.min(b.end).max(start)
+}
 
 pub struct PdfTabData {
     path: PathBuf,
@@ -57,152 +125,359 @@ impl gpui::ImageCache for NoGpuiImageCache {
     }
 }
 
-struct ImageCacheMutableState {
-    used: Vec<Option<Arc<RenderImage>>>,
-    unused: Vec<Option<Arc<RenderImage>>>,
-    in_progress: Vec<bool>,
-    gc_counter: u32,
-}
-impl ImageCacheMutableState {
-    fn mark_as_used(&mut self, index: usize, data: Arc<RenderImage>) {
-        if self.used.len() <= index {
-            self.used.resize_with(index + 1, || None);
-        }
-        self.used[index] = Some(data);
-        self.set_in_progress(index, false);
-    }
-    fn set_in_progress(&mut self, index: usize, value: bool) {
-        if self.in_progress.len() <= index {
-            self.in_progress.resize(index + 1, false);
-        }
-        self.in_progress[index] = value;
-    }
-}
-struct ImageCache {
-    state: Mutex<ImageCacheMutableState>,
-    render_settings: RenderSettings,
+struct PdfPageCacheMutableState {
+    /// Currently cached images of PDF pages. Index of an image is the PDF page's index.
+    images: Vec<Option<Arc<RenderImage>>>,
+    /// Settings (zoom) that will be used when rendering images.
+    render_settings: RenderSettings2,
+    /// The parsed PDF file that the background thread will rasterize.
     pdf: Option<Arc<Pdf>>,
+    /// Notify/wake the foreground future so that it can request a re-render of the UI with newly
+    /// cached images.
+    wake_future: Option<Waker>,
+    /// All pages in the range should eventually be cached.
+    requested_pages: Range<usize>,
+    /// The background thread has acknowledged that pages in this range will be rendered.
+    acknowledged_pages: Range<usize>,
+    /// If `true` then background worker thread and foreground task will exit.
+    should_quit: bool,
 }
-impl ImageCache {
-    pub fn new() -> Self {
-        Self {
-            state: Mutex::new(ImageCacheMutableState {
-                used: Vec::with_capacity(256),
-                unused: Vec::with_capacity(256),
-                in_progress: Vec::with_capacity(256),
-                gc_counter: 0,
+impl PdfPageCacheMutableState {
+    pub fn set_new_pdf(&mut self, pdf: Option<Arc<Pdf>>, render_settings: RenderSettings2) {
+        self.images.clear(); // <- always clear to ensure all items are None.
+        if let Some(pdf) = pdf.as_ref() {
+            self.images.resize_with(pdf.pages().len(), || None);
+        }
+        self.requested_pages = 0..0;
+        self.acknowledged_pages = 0..0;
+        self.render_settings = render_settings;
+        self.pdf = pdf;
+    }
+}
+struct PdfPageCacheSharedState {
+    state: Mutex<PdfPageCacheMutableState>,
+    wake_worker: Condvar,
+}
+struct PdfPageCache {
+    /// Data shared between background worker thread, frontend async task and [`PdfPages`] view.
+    shared: Arc<PdfPageCacheSharedState>,
+    /// Dropping this will stop the foreground task.
+    _ui_updater: Task<()>,
+    /// PDF pages rendered this frame.
+    pages_this_frame: Range<usize>,
+    /// PDF pages rendered previous frame (keep this in cache).
+    pages_last_frame: Range<usize>,
+}
+impl Drop for PdfPageCache {
+    fn drop(&mut self) {
+        let mut guard = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.should_quit = true;
+        let waker = guard.wake_future.take();
+        drop(guard);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        self.shared.wake_worker.notify_all();
+    }
+}
+impl PdfPageCache {
+    pub fn new(window: &mut Window, cx: &mut Context<PdfPages>) -> Self {
+        let shared = Arc::new(PdfPageCacheSharedState {
+            state: Mutex::new(PdfPageCacheMutableState {
+                images: Vec::with_capacity(256),
+                render_settings: RenderSettings2 {
+                    x_scale: 1.,
+                    y_scale: 1.,
+                    ..Default::default()
+                },
+                pdf: None,
+                wake_future: None,
+                requested_pages: 0..0,
+                acknowledged_pages: 0..0,
+                should_quit: false,
             }),
-            render_settings: RenderSettings {
-                x_scale: 1.,
-                y_scale: 1.,
-                ..Default::default()
-            },
-            pdf: None,
-        }
+            wake_worker: Condvar::new(),
+        });
+        let this = Self {
+            shared: shared.clone(),
+            _ui_updater: cx.spawn_in(window, {
+                let shared = shared.clone();
+                async move |parent, window| Self::foreground_work(shared, parent, window).await
+            }),
+            pages_this_frame: 0..0,
+            pages_last_frame: 0..0,
+        };
+        std::thread::spawn(move || Self::background_work(shared));
+
+        this
     }
-    pub fn gc(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let this = &mut *guard;
 
-        let total_size = this.used.len() + this.unused.len();
-        this.gc_counter += 1;
-        if this.gc_counter >= 3 || total_size > 6 {
-            this.unused.clear();
-            std::mem::swap(&mut this.used, &mut this.unused);
-            this.gc_counter = 0;
+    /// Notify [`PdfPages`] view when new PDF pages have been rendered by the worker thread running
+    /// [`Self::background_work`].
+    async fn foreground_work(
+        shared: Arc<PdfPageCacheSharedState>,
+        parent: WeakEntity<PdfPages>,
+        window: &mut AsyncWindowContext,
+    ) {
+        struct WaitForChange<'a> {
+            shared: &'a PdfPageCacheSharedState,
+            rendered_images: &'a mut Vec<bool>,
         }
-    }
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn get_image(
-        self: &Arc<Self>,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<PdfPages>,
-    ) -> Option<Arc<RenderImage>> {
-        let mut guard = self.state.lock().unwrap();
-        if let Some(image) = guard.used.get(index).cloned().flatten() {
-            eprintln!("Cache hit for page {index} (in used)");
-            return Some(image);
-        } else if let Some(image) = guard.unused.get_mut(index).and_then(|slot| slot.take()) {
-            eprintln!("Cache hit for page {index} (in unused)");
-            guard.mark_as_used(index, image.clone());
-            Some(image)
-        } else {
-            eprintln!("Cache miss for page {index}");
-            if matches!(guard.in_progress.get(index), Some(true)) {
-                return None; // already rendering in background.
-            }
-            let Some(pdf) = self.pdf.clone() else {
-                return None;
-            };
-            guard.set_in_progress(index, true);
-            drop(guard);
+        impl<'a> Future for WaitForChange<'a> {
+            type Output = bool;
 
-            let window = window.to_async(cx);
-            let this = self.clone();
-            let background = cx.background_spawn(async move {
-                let generate_image = || {
-                    let interpreter_settings = InterpreterSettings::default();
+            fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                let mut guard = this.shared.state.lock().unwrap();
 
-                    let pixmap = render(
-                        &pdf.pages()[index],
-                        &interpreter_settings,
-                        &this.render_settings,
-                    );
-                    // Code from: <gpui::ImageDecoder as Asset>::load
-                    // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
+                this.rendered_images
+                    .resize_with(guard.images.len(), || false);
 
-                    let width = u32::from(pixmap.width());
-                    let height = u32::from(pixmap.height());
-                    let mut data = pixmap.take_u8();
-                    // Convert from RGBA to BGRA.
-                    for pixel in data.chunks_exact_mut(4) {
-                        pixel.swap(0, 2);
+                let mut changed_state = false;
+                for (cache, is_cached) in guard.images.iter().zip(this.rendered_images.iter_mut()) {
+                    if cache.is_some() != *is_cached {
+                        *is_cached = cache.is_some();
+                        changed_state = true;
                     }
-                    let image_data = RgbaImage::from_raw(width, height, data).unwrap();
-                    Arc::new(RenderImage::new([Frame::new(image_data)]))
-                };
-
-                #[cfg(feature = "hotpath")]
-                let render_image = hotpath::measure_block!("generate_image", generate_image());
-                #[cfg(not(feature = "hotpath"))]
-                let render_image = generate_image();
-
-                {
-                    let mut guard = this.state.lock().unwrap();
-                    guard.mark_as_used(index, render_image);
-                    guard.set_in_progress(index, false);
                 }
-            });
-            let parent = cx.weak_entity();
-            window
-                .spawn(async move |window| {
-                    background.await;
 
-                    if let Some(parent) = parent.upgrade() {
-                        _ = window.update_entity(&parent, |_view, cx: &mut Context<PdfPages>| {
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
-            None
+                if guard.should_quit || changed_state {
+                    Poll::Ready(guard.should_quit)
+                } else {
+                    guard.wake_future = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
         }
+
+        // array of bools (true if an image is known to be cached)
+        let mut rendered_images = Vec::with_capacity(256);
+        loop {
+            let should_quit = WaitForChange {
+                shared: &*shared,
+                rendered_images: &mut rendered_images,
+            }
+            .await;
+            if should_quit {
+                return;
+            }
+
+            let result = parent.update(window, |_parent, cx| {
+                log::debug!("Notify view about new pdf pages");
+                cx.notify();
+            });
+            if result.is_err() {
+                // parent view dropped
+                return;
+            }
+        }
+    }
+
+    /// Executed by dedicated worker thread that will rasterize PDF pages as requested by the
+    /// [`Self::get_images`] method.
+    fn background_work(shared: Arc<PdfPageCacheSharedState>) {
+        let mut guard = shared.state.lock().unwrap();
+        loop {
+            // Check if we need to rasterize another page:
+            let mut index_to_render = None;
+            {
+                let mut wanted_pages = guard.requested_pages.clone();
+
+                // more aggressively cache earlier pages since the virtual list doesn't:
+                wanted_pages.start = wanted_pages.start.saturating_sub(1);
+
+                // Chose the page closest to the center of the requested range:
+                let mut chose_index_distance = usize::MAX;
+                let center = wanted_pages.end.saturating_sub(1 + wanted_pages.len() / 2);
+
+                // We special case caching of the first page since the virtual list always requests it
+                let cache_first_image = guard.requested_pages.start <= 1;
+
+                for (index, image) in guard.images.iter_mut().enumerate() {
+                    let should_cache = if index == 0 {
+                        cache_first_image
+                    } else {
+                        wanted_pages.contains(&index)
+                    };
+                    if !should_cache {
+                        *image = None;
+                    } else if image.is_none() {
+                        let distance = index.abs_diff(center);
+                        if distance < chose_index_distance {
+                            index_to_render = Some(index);
+                            chose_index_distance = distance;
+                        }
+                    }
+                }
+            }
+
+            log::debug!(
+                "Rasterize page {index_to_render:?}, acknowledged_pages={:?}, requested_pages={:?}",
+                guard.acknowledged_pages.clone(),
+                guard.requested_pages.clone()
+            );
+            guard.acknowledged_pages = guard.requested_pages.clone();
+
+            if let Some(index) = index_to_render {
+                // Copy render inputs:
+                let Some(pdf) = guard.pdf.clone() else {
+                    continue;
+                };
+                let render_settings = guard.render_settings;
+
+                // render while not holding the lock:
+                drop(guard);
+                let new_image = Self::rasterize_pdf_page(
+                    &pdf.pages()[index],
+                    &RenderSettings::from(render_settings),
+                );
+
+                // re-acquire lock and save new image to shared state:
+                guard = shared.state.lock().unwrap();
+                if guard.render_settings == render_settings
+                    && guard
+                        .pdf
+                        .as_ref()
+                        .is_some_and(|new_pdf| Arc::ptr_eq(&pdf, &new_pdf))
+                {
+                    if let Some(image) = guard.images.get_mut(index) {
+                        *image = Some(new_image);
+                        log::debug!(
+                            "Rasterize image done, index={index}, acknowledged_pages={:?}, wake_frontend={}",
+                            guard.acknowledged_pages,
+                            guard.wake_future.is_some()
+                        );
+                        if let Some(waker) = guard.wake_future.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+            } else {
+                // Nothing more to render (ensure range is correct and then wait):
+                guard = shared
+                    .wake_worker
+                    .wait_while(guard, |state| {
+                        !state.should_quit && state.acknowledged_pages == state.requested_pages
+                    })
+                    .unwrap();
+            }
+
+            if guard.should_quit {
+                return;
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn rasterize_pdf_page(page: &Page, render_settings: &RenderSettings) -> Arc<RenderImage> {
+        let interpreter_settings = InterpreterSettings::default();
+
+        let pixmap = render(page, &interpreter_settings, &render_settings);
+        // The code below that converts to RenderImage was inspired by code from:
+        // <gpui::ImageDecoder as Asset>::load
+        //
+        // The more "normal" way to convert it would be using:
+        // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
+
+        let width = u32::from(pixmap.width());
+        let height = u32::from(pixmap.height());
+        let mut data = pixmap.take_u8();
+
+        // Convert from RGBA to BGRA.
+        for pixel in data.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+
+        let image_data =
+            RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
+        Arc::new(RenderImage::new([Frame::new(image_data)]))
+    }
+
+    pub fn clear(&self) {
+        self.set_new_pdf(None, RenderSettings2::default());
+    }
+    pub fn set_new_pdf(&self, pdf: Option<Arc<Pdf>>, render_settings: RenderSettings2) {
+        let mut guard = self.shared.state.lock().unwrap();
+        guard.set_new_pdf(pdf, render_settings);
+    }
+
+    pub fn frame_start(&mut self) {
+        log::trace!(r"PdfPage render started \\//");
+        self.pages_last_frame = self.pages_this_frame.clone();
+        self.pages_this_frame = 0..0;
+    }
+
+    pub fn get_images(
+        &mut self,
+        visible_range: Range<usize>,
+        _window: &mut Window,
+        _cx: &mut Context<PdfPages>,
+    ) -> Vec<Option<Arc<RenderImage>>> {
+        let mut guard = self.shared.state.lock().unwrap();
+        let images = if let Some(images) = guard.images.get(visible_range.clone()) {
+            images.to_vec()
+        } else {
+            vec![None; visible_range.len()]
+        };
+
+        if visible_range.start == 0 && visible_range.end == 1 {
+            // Don't track request for only the first page since the virtual list always requests it.
+            return images;
+        }
+
+        if self.pages_this_frame.len() == 0
+            || !range_is_contiguous(self.pages_this_frame.clone(), visible_range.clone())
+        {
+            // If non-contiguous: ignore previous range this frame, it was likely rendered
+            // incorrectly before layout calculations determined that they weren't visible
+            self.pages_this_frame = visible_range.clone();
+        } else {
+            // Keep previously rendered pages cached.
+            self.pages_this_frame =
+                range_union(self.pages_this_frame.clone(), visible_range.clone());
+        }
+
+        // Tell the background thread about the new image range:
+        guard.requested_pages =
+            range_union(self.pages_this_frame.clone(), self.pages_last_frame.clone());
+
+        if guard.requested_pages != guard.acknowledged_pages {
+            if let Some(waker) = guard.wake_future.take() {
+                waker.wake();
+            }
+            drop(guard);
+            self.shared.wake_worker.notify_all();
+        }
+
+        log::trace!(
+            "Rendering pdf pages at visible_range={visible_range:?}, current_images={:?}",
+            images
+                .iter()
+                .map(|image| image.is_some())
+                .collect::<Vec<_>>()
+        );
+
+        images
     }
 }
 
 pub struct PdfPages {
+    /// Current scroll position.
     scroll_handle: VirtualListScrollHandle,
+    /// State of the scrollbar element.
     scroll_state: ScrollbarState,
+    /// Pointer to scroll info inside tab data. Use to save current scroll position before loading a new PDF.
     save_scroll: Arc<Mutex<VirtualListScrollHandle>>,
+    /// Sizes of each page in the PDF file.
     item_sizes: Rc<Vec<Size<Pixels>>>,
-    images: Arc<ImageCache>,
+    /// Cached rasterized PDF pages.
+    pdf_page_cache: PdfPageCache,
     /// Used to bypass GPUI's inbuilt image cache.
     disabled_cache: Entity<NoGpuiImageCache>,
 }
 impl PdfPages {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             scroll_handle: VirtualListScrollHandle::from(ScrollHandle::default()),
             scroll_state: Default::default(),
@@ -210,7 +485,7 @@ impl PdfPages {
                 ScrollHandle::new(),
             ))),
             item_sizes: Rc::new(vec![]),
-            images: Arc::new(ImageCache::new()),
+            pdf_page_cache: PdfPageCache::new(window, cx),
             disabled_cache: cx.new(|_cx| NoGpuiImageCache),
         }
     }
@@ -218,8 +493,8 @@ impl PdfPages {
 impl Render for PdfPages {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.images.gc();
-        div()
+        self.pdf_page_cache.frame_start();
+        let element = div()
             .relative()
             .size_full()
             .child(
@@ -228,10 +503,10 @@ impl Render for PdfPages {
                     "pdf-viewer-pages-list",
                     self.item_sizes.clone(),
                     move |view, visible_range, window, cx| {
-                        eprintln!("Render {visible_range:?}");
                         visible_range
-                            .map(|row_ix| {
-                                let page_image = view.images.get_image(row_ix, window, cx);
+                            .clone()
+                            .zip(view.pdf_page_cache.get_images(visible_range, window, cx))
+                            .map(|(_row_ix, page_image)| {
                                 if let Some(page_image) = page_image {
                                     img(page_image)
                                         .object_fit(ObjectFit::Cover)
@@ -263,7 +538,9 @@ impl Render for PdfPages {
                             .axis(ScrollbarAxis::Vertical),
                     ),
             )
-            .into_any_element()
+            .into_any_element();
+
+        element
     }
 }
 
@@ -308,7 +585,7 @@ impl PdfReader {
     fn active_pdf_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pages.update(cx, |pages, cx| {
             pages.item_sizes = Rc::new(vec![]); // forget page sizes
-            pages.images = Arc::new(ImageCache::new()); // clear cache
+            pages.pdf_page_cache.clear(); // clear cache
 
             *pages.save_scroll.lock().unwrap() = pages.scroll_handle.clone(); // save scroll
             pages.scroll_handle = VirtualListScrollHandle::from(ScrollHandle::default()); // reset scroll
@@ -324,7 +601,6 @@ impl PdfReader {
             if pdf.pages().is_empty() {
                 return;
             }
-
             let viewport_size = window.viewport_size();
 
             // Scale to fit window width:
@@ -344,10 +620,9 @@ impl PdfReader {
             };
 
             // Update image rendering:
-            let mut cache = ImageCache::new();
-            cache.render_settings = render_settings;
-            cache.pdf = Some(pdf.clone());
-            pages.images = Arc::new(cache);
+            pages
+                .pdf_page_cache
+                .set_new_pdf(Some(pdf.clone()), render_settings.into());
 
             // Update layout/sizes:
             self.assumed_viewport_size = viewport_size;
@@ -492,6 +767,14 @@ impl Update<PdfCommand> for PdfReader {
 
 #[cfg_attr(feature = "hotpath", hotpath::main)]
 pub fn start_gui() {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("RUST_LOG").is_none() {
+            unsafe { std::env::set_var("RUST_LOG", "trace") };
+        }
+    }
+    env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
+
     // let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     // let _rt_guard = rt.enter();
 
