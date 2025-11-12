@@ -12,12 +12,32 @@ The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive
 
 ## References
 
-- [GPUI](https://www.gpui.rs/)
-  - [GitHub](https://github.com/zed-industries/zed/tree/main/crates/gpui)
-  - [docs.rs](https://docs.rs/gpui/latest/gpui/)
-- [GPUI Component](https://longbridge.github.io/gpui-component/)
-  - [GitHub](https://github.com/longbridge/gpui-component)
-  - [docs.rs](https://docs.rs/gpui-component/latest/gpui_component/)
+- GUI
+  - [GPUI](https://www.gpui.rs/)
+    - [GitHub](https://github.com/zed-industries/zed/tree/main/crates/gpui)
+    - [docs.rs](https://docs.rs/gpui/latest/gpui/)
+  - [GPUI Component](https://longbridge.github.io/gpui-component/)
+    - [GitHub](https://github.com/longbridge/gpui-component)
+    - [docs.rs](https://docs.rs/gpui-component/latest/gpui_component/)
+- PDF
+  - [`mupdf` -  Safe Rust wrapper to MuPDF ](https://crates.io/crates/mupdf/0.5.0)
+    - Used by `miro`, `tdf` and `MView6`.
+    - License: `AGPL-3.0`
+  - [`pdfium-render` -  A high-level idiomatic Rust wrapper around Pdfium, the C++ PDF library used by the Google Chromium project. ](https://crates.io/crates/pdfium-render)
+    - License: `MIT` or `Apache-2.0`
+  - [`hayro` -  A rasterizer for PDF files. ](https://crates.io/crates/hayro)
+    - Has a [demo website](https://laurenzv.github.io/hayro/).
+    - License: `Apache-2.0`
+  - [`poppler` -  Wrapper for the GPL-licensed Poppler PDF rendering library. ](https://crates.io/crates/poppler)
+    - License: `GPL-2.0`
+  - [`printpdf` -  Rust library for reading and writing PDF files ](https://crates.io/crates/printpdf)
+    - Has a [printpdf-wasm Demo](https://fschutt.github.io/printpdf/)
+    - License: `MIT`
+  - [`pdfium` - Modern Rust interface to PDFium, the PDF library from Google](https://crates.io/crates/pdfium)
+    - Used by `MView6`.
+    - License: `GPL-3.0`
+  - [PDF.js - A general-purpose, web standards-based platform for parsing and rendering PDFs.](https://mozilla.github.io/pdf.js/)
+    - Can maybe be used inside a webview.
 
 ## Alternatives
 
