@@ -7,9 +7,12 @@ use gpui_component::button::Button;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, StyledExt};
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
 #[action(namespace = tabs)]
@@ -36,7 +39,7 @@ pub struct TabsView<T: 'static> {
     active_tab: usize,
     tabs: Vec<Option<T>>,
     scroll_handle: ScrollHandle,
-    latest_scroll_offset: Point<Pixels>,
+    latest_scroll_offset: Rc<Cell<Point<Pixels>>>,
     on_tab_changed: Box<dyn Fn(&mut Window, &mut Context<Self>) + 'static>,
 }
 impl<T> TabsView<T> {
@@ -45,7 +48,7 @@ impl<T> TabsView<T> {
             active_tab: 0,
             tabs: vec![None],
             scroll_handle: ScrollHandle::new(),
-            latest_scroll_offset: Point::default(),
+            latest_scroll_offset: Rc::new(Cell::new(Point::default())),
             on_tab_changed: Box::new(|_window, _cx| {}),
         }
     }
@@ -78,16 +81,31 @@ impl<T> TabsView<T> {
         (self.on_tab_changed)(window, cx);
     }
 
-    pub fn scroll_to_active_tab(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn scroll_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             self.scroll_handle.set_offset(Point::default());
         } else {
             self.scroll_handle.scroll_to_item(self.active_tab);
         }
-        self.save_latest_scroll();
+        self.save_latest_scroll(window, cx);
     }
-    fn save_latest_scroll(&mut self) {
-        self.latest_scroll_offset = self.scroll_handle.offset();
+    fn save_latest_scroll(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.latest_scroll_offset.set(self.scroll_handle.offset());
+
+        cx.foreground_executor()
+            .spawn({
+                let background = cx.background_executor().clone();
+                let latest_scroll_offset = self.latest_scroll_offset.clone();
+                let scroll_handle = self.scroll_handle.clone();
+                async move {
+                    // TODO: perf - only check after actions have been taken
+                    loop {
+                        background.timer(Duration::from_millis(100)).await;
+                        latest_scroll_offset.set(scroll_handle.offset());
+                    }
+                }
+            })
+            .detach();
     }
     pub fn active_tab(&self) -> usize {
         self.active_tab
@@ -221,12 +239,12 @@ impl<T: TabData> Render for TabsView<T> {
                     .left_0()
                     .overflow_hidden()
                     .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
-                        let prev_offset = view.latest_scroll_offset;
-                        view.save_latest_scroll();
+                        let prev_offset = view.latest_scroll_offset.get();
+                        view.save_latest_scroll(window, cx);
 
                         if event.control {
                             view.scroll_handle.set_offset(prev_offset);
-                            view.save_latest_scroll();
+                            view.save_latest_scroll(window, cx);
 
                             match event.delta.pixel_delta(px(1.0)).y.cmp(&px(0.)) {
                                 Ordering::Greater => {
@@ -249,7 +267,7 @@ impl<T: TabData> Render for TabsView<T> {
                             }
                         }
                     }))
-                    .child(tab_bar)
+                    .child(tab_bar),
             )
     }
 }
