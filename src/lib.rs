@@ -99,7 +99,7 @@ pub fn range_intersection(a: Range<usize>, b: Range<usize>) -> Range<usize> {
 }
 
 pub struct PdfTabData {
-    path: PathBuf,
+    path: Arc<PathBuf>,
     pdf_data: Arc<Vec<u8>>,
     scroll: Arc<Mutex<VirtualListScrollHandle>>,
 }
@@ -110,6 +110,10 @@ impl tabs::TabData for PdfTabData {
         } else {
             "<invalid path>".into()
         }
+    }
+
+    fn full_path(&self) -> Arc<PathBuf> {
+        self.path.clone()
     }
 }
 
@@ -749,7 +753,7 @@ impl Update<PdfCommand> for PdfReader {
             PdfCommand::LoadedData(path, pdf_data) => {
                 if let Some(tab_data) = self.tabs.as_mut(cx).active_tab_data_mut() {
                     *tab_data = Some(PdfTabData {
-                        path,
+                        path: Arc::new(path),
                         pdf_data: Arc::new(pdf_data),
                         scroll: Arc::new(Mutex::new(VirtualListScrollHandle::from(
                             ScrollHandle::new(),

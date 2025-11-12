@@ -1,12 +1,15 @@
 use gpui::{
     AlignItems, Context, Empty, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
-    StyleRefinement, Styled, Window, div, px,
+    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::tab::{Tab, TabBar};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, StyledExt};
 use std::cmp::Ordering;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
 #[action(namespace = tabs)]
@@ -26,6 +29,7 @@ pub struct PrevTab;
 
 pub trait TabData: 'static {
     fn label(&self) -> SharedString;
+    fn full_path(&self) -> Arc<PathBuf>;
 }
 
 pub struct TabsView<T: 'static> {
@@ -139,7 +143,6 @@ impl<T: TabData> Render for TabsView<T> {
             Empty.into_any_element()
         } else {
             div()
-                .absolute()
                 .top_0()
                 .right_0()
                 .bottom_0()
@@ -151,7 +154,7 @@ impl<T: TabData> Render for TabsView<T> {
                             view.scroll_to_active_tab(window, cx);
                         })),
                 )
-                .flex_shrink_0()
+                .flex_none()
                 .into_any_element()
         };
         let tab_bar = TabBar::new("dynamic-tabs-with-pdf-files")
@@ -168,6 +171,28 @@ impl<T: TabData> Render for TabsView<T> {
                 } else {
                     "New tab".into()
                 })
+                .suffix(
+                    Button::new("button-close-tab")
+                        .icon(Icon::new(IconName::Close))
+                        .on_click(cx.listener(move |view, _event, window, cx| {
+                            view.remove_tab(tab_index, window, cx);
+                            view.scroll_to_active_tab(window, cx);
+                        }))
+                        .max_w_6()
+                        .max_h_6(),
+                )
+                .tooltip({
+                    let full_path = tab_data
+                        .as_ref()
+                        .map(|d| SharedString::from(format!("{}", d.full_path().display())));
+                    move |window, cx| {
+                        if full_path.is_none() {
+                            Tooltip::element(|_window, _cx| Empty).build(window, cx)
+                        } else {
+                            Tooltip::new(full_path.clone().unwrap_or_default()).build(window, cx)
+                        }
+                    }
+                })
                 .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
                     if let MouseDownEvent {
                         button: MouseButton::Middle,
@@ -182,19 +207,19 @@ impl<T: TabData> Render for TabsView<T> {
 
         div()
             .flex()
-            .flex_row()
+            .flex_row_reverse()
             .w_full()
-            .min_h(px(33.))
+            .overflow_hidden()
             .refine_style(&StyleRefinement {
                 align_items: Some(AlignItems::Stretch),
                 ..Default::default()
             })
+            .child(new_tab_button)
             .child(
                 div()
-                    .absolute()
-                    .top_0()
+                    .flex_1()
                     .left_0()
-                    .right_8()
+                    .overflow_hidden()
                     .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
                         let prev_offset = view.latest_scroll_offset;
                         view.save_latest_scroll();
@@ -224,8 +249,7 @@ impl<T: TabData> Render for TabsView<T> {
                             }
                         }
                     }))
-                    .child(tab_bar),
+                    .child(tab_bar)
             )
-            .child(new_tab_button)
     }
 }
