@@ -225,7 +225,10 @@ impl PdfPageCache {
             pages_last_frame: 0..0,
             rendered_images: Default::default(),
         };
-        std::thread::spawn(move || Self::background_work(shared));
+        std::thread::Builder::new()
+            .name("PDF Rasterizer".to_owned())
+            .spawn(move || Self::background_work(shared))
+            .expect("failed to spawn background worker thread");
 
         this
     }
