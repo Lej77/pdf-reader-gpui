@@ -12,8 +12,6 @@ default = []
 pdf-js = ["gpui-component/webview", "dep:wry"] # TODO: support PDF.js, maybe adapt code from https://github.com/dmanuel64/leptos-pdf
 mimalloc = ["dep:mimalloc"]
 
-bulk-free-alloc = [] # Force free all memory used by hayro
-
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-alloc-bytes-total = ["hotpath/hotpath-alloc-bytes-total"]
 hotpath-alloc-count-total = ["hotpath/hotpath-alloc-count-total"]
