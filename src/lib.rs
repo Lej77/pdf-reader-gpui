@@ -2,6 +2,9 @@ use gpui::{
     AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
     Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, Task, WeakEntity, size,
 };
+use std::alloc::{GlobalAlloc, Layout};
+use std::any::Any;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -26,13 +29,130 @@ use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
 use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
 #[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc as FallbackAllocator;
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(not(feature = "mimalloc"))]
+use std::alloc::System as FallbackAllocator;
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: ThreadLocalAlloc<FallbackAllocator> =
+    unsafe { ThreadLocalAlloc::new(FallbackAllocator) };
+
+trait CurrentGlobalAlloc: GlobalAlloc + Any {}
+impl<T: GlobalAlloc + Any> CurrentGlobalAlloc for T {}
+
+thread_local! {
+    static CURRNET_ALLOCATOR: RefCell<Option<&'static dyn CurrentGlobalAlloc>> = const { RefCell::new(None) };
+}
+static ENABLED_THREAD_LOCAL_ALLOC: AtomicBool = AtomicBool::new(false);
+struct ThreadLocalAlloc<T> {
+    fallback: T,
+}
+impl<T> ThreadLocalAlloc<T> {
+    pub const unsafe fn new(fallback: T) -> Self {
+        Self { fallback }
+    }
+}
+unsafe impl<T: GlobalAlloc> GlobalAlloc for ThreadLocalAlloc<T> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if ENABLED_THREAD_LOCAL_ALLOC.load(Relaxed)
+            && let Ok(Some(memory)) = CURRNET_ALLOCATOR.try_with(|global| {
+                global
+                    .borrow()
+                    .as_ref()
+                    .map(|alloc| unsafe { alloc.alloc(layout) })
+            })
+        {
+            memory
+        } else {
+            unsafe { self.fallback.alloc(layout) }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ENABLED_THREAD_LOCAL_ALLOC.load(Relaxed)
+            && let Ok(Some(())) = CURRNET_ALLOCATOR.try_with(|global| {
+                global
+                    .borrow()
+                    .as_ref()
+                    .map(|alloc| unsafe { alloc.dealloc(ptr, layout) })
+            })
+        {
+            // done
+        } else {
+            unsafe { self.fallback.dealloc(ptr, layout) }
+        }
+    }
+}
+
+struct BulkFreeAlloc<'a> {
+    allocations: RefCell<(usize, [(*mut u8, Layout); 1024 * 1024])>,
+    allocator: &'a dyn GlobalAlloc,
+}
+impl<'a> BulkFreeAlloc<'a> {
+    const EMPTY_SLOT: (*mut u8, Layout) = (std::ptr::null_mut(), unsafe {
+        Layout::from_size_align_unchecked(0, 2)
+    });
+    pub const unsafe fn new(allocator: &'a dyn GlobalAlloc) -> Self {
+        Self {
+            allocations: RefCell::new((0, [Self::EMPTY_SLOT; _])),
+            allocator,
+        }
+    }
+    pub fn forget(&self, ptr: *mut u8) {
+        let mut allocations = self.allocations.borrow_mut();
+        let allocations = &mut *allocations;
+        for (index, slot) in allocations.1.iter_mut().enumerate().take(allocations.0).rev() {
+            if std::ptr::eq(slot.0, ptr) {
+                *slot = Self::EMPTY_SLOT;
+                if index + 1 == allocations.0 {
+                    allocations.0 = index;
+                }
+                break;
+            }
+        }
+    }
+    pub fn free_all(&self) {
+        let mut allocations = self.allocations.borrow_mut();
+        let allocations = &mut *allocations;
+
+        for (_index, slot) in allocations.1.iter_mut().enumerate().take(allocations.0) {
+            if !slot.0.is_null() {
+                unsafe { self.allocator.dealloc(slot.0, slot.1) };
+                *slot = Self::EMPTY_SLOT;
+            }
+        }
+        allocations.0 = 0;
+    }
+}
+unsafe impl GlobalAlloc for BulkFreeAlloc<'_> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { self.allocator.alloc(layout) };
+        {
+            let mut allocations = self.allocations.borrow_mut();
+            let  allocations = &mut *allocations;
+            allocations.1[allocations.0].0 = ptr;
+            allocations.1[allocations.0].1 = layout;
+            allocations.0 += 1;
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.forget(ptr);
+
+        unsafe { self.allocator.dealloc(ptr, layout) };
+    }
+}
 
 /// This type is the same as [`RenderSettings`] except it implements more traits.
 #[derive(Clone, Copy, PartialEq)]
@@ -372,25 +492,41 @@ impl PdfPageCache {
     fn rasterize_pdf_page(page: &Page, render_settings: &RenderSettings) -> Arc<RenderImage> {
         let interpreter_settings = InterpreterSettings::default();
 
-        let pixmap = render(page, &interpreter_settings, &render_settings);
-        // The code below that converts to RenderImage was inspired by code from:
-        // <gpui::ImageDecoder as Asset>::load
-        //
-        // The more "normal" way to convert it would be using:
-        // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
+        // FIXME: hayro::render leaks memory so as a workaround try overriding the allocator to one that can bulk free all its memory.
 
-        let width = u32::from(pixmap.width());
-        let height = u32::from(pixmap.height());
-        let mut data = pixmap.take_u8();
-
-        // Convert from RGBA to BGRA.
-        for pixel in data.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
+        ENABLED_THREAD_LOCAL_ALLOC.store(true, Relaxed);
+        thread_local! {
+            static BULK_ALLOC: BulkFreeAlloc = const {unsafe { BulkFreeAlloc::new(&FallbackAllocator) }};
         }
+        BULK_ALLOC.with(|bulk_alloc| {
+            let bulk_alloc: &'static BulkFreeAlloc = unsafe { &*(bulk_alloc as *const _) };
+            #[cfg(feature = "bulk-free-alloc")]
+            CURRNET_ALLOCATOR.set(Some(bulk_alloc));
+            let pixmap = render(page, &interpreter_settings, &render_settings);
+            CURRNET_ALLOCATOR.set(None);
 
-        let image_data =
-            RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
-        Arc::new(RenderImage::new([Frame::new(image_data)]))
+            // The code below that converts to RenderImage was inspired by code from:
+            // <gpui::ImageDecoder as Asset>::load
+            //
+            // The more "normal" way to convert it would be using:
+            // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
+
+            let width = u32::from(pixmap.width());
+            let height = u32::from(pixmap.height());
+            let mut data = pixmap.take_u8();
+
+            bulk_alloc.forget(data.as_mut_ptr());
+            bulk_alloc.free_all();
+
+            // Convert from RGBA to BGRA.
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+
+            let image_data =
+                RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
+            Arc::new(RenderImage::new([Frame::new(image_data)]))
+        })
     }
 
     pub fn clear(&self) {
