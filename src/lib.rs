@@ -1,12 +1,3 @@
-use gpui::{
-    AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
-    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, Task, WeakEntity, size,
-};
-use std::ops::Range;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::rc::Rc;
-
 pub mod assets;
 pub mod elm;
 pub mod prompt;
@@ -17,8 +8,10 @@ use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
 use gpui::{
-    App, AppContext, Application, Context, IntoElement, ObjectFit, ParentElement, Render, Size,
-    Styled, Window, WindowOptions, div, img, px,
+    App, AppContext, Application, AsyncWindowContext, Context, Entity, FocusHandle,
+    ImageCacheError, ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit,
+    ParentElement, Pixels, Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled,
+    StyledImage, Task, WeakEntity, Window, WindowOptions, div, img, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
@@ -26,6 +19,12 @@ use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
 use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -129,6 +128,19 @@ impl gpui::ImageCache for NoGpuiImageCache {
     }
 }
 
+struct ArcIdentity<T>(Arc<T>);
+impl<T> Hash for ArcIdentity<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_usize(Arc::as_ptr(&self.0).addr());
+    }
+}
+impl<T> PartialEq for ArcIdentity<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl<T> Eq for ArcIdentity<T> {}
+
 struct PdfPageCacheMutableState {
     /// Currently cached images of PDF pages. Index of an image is the PDF page's index.
     images: Vec<Option<Arc<RenderImage>>>,
@@ -171,6 +183,7 @@ struct PdfPageCache {
     pages_this_frame: Range<usize>,
     /// PDF pages rendered previous frame (keep this in cache).
     pages_last_frame: Range<usize>,
+    rendered_images: HashSet<ArcIdentity<RenderImage>>,
 }
 impl Drop for PdfPageCache {
     fn drop(&mut self) {
@@ -210,6 +223,7 @@ impl PdfPageCache {
             }),
             pages_this_frame: 0..0,
             pages_last_frame: 0..0,
+            rendered_images: Default::default(),
         };
         std::thread::spawn(move || Self::background_work(shared));
 
@@ -405,10 +419,19 @@ impl PdfPageCache {
         guard.set_new_pdf(pdf, render_settings);
     }
 
-    pub fn frame_start(&mut self) {
+    pub fn frame_start(&mut self, window: &mut Window, _cx: &mut Context<PdfPages>) {
         log::trace!(r"PdfPage render started \\//");
         self.pages_last_frame = self.pages_this_frame.clone();
         self.pages_this_frame = 0..0;
+
+        self.rendered_images.retain(|image| {
+            if Arc::strong_count(&image.0) == 1 {
+                _ = window.drop_image(image.0.clone());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn get_images(
@@ -423,6 +446,13 @@ impl PdfPageCache {
         } else {
             vec![None; visible_range.len()]
         };
+
+        self.rendered_images.extend(
+            images
+                .iter()
+                .filter_map(|slot| slot.as_ref())
+                .map(|image| ArcIdentity(image.clone())),
+        );
 
         if visible_range.start == 0 && visible_range.end == 1 {
             // Don't track request for only the first page since the virtual list always requests it.
@@ -496,8 +526,13 @@ impl PdfPages {
 }
 impl Render for PdfPages {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.pdf_page_cache.frame_start();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn weak_image(image: &Arc<RenderImage>) -> ImageSource {
+            let image = Arc::downgrade(image);
+            ImageSource::Custom(Arc::new(move |_window, _cx| Some(Ok(image.upgrade()?))))
+        }
+
+        self.pdf_page_cache.frame_start(window, cx);
         let element = div()
             .relative()
             .size_full()
@@ -512,7 +547,7 @@ impl Render for PdfPages {
                             .zip(view.pdf_page_cache.get_images(visible_range, window, cx))
                             .map(|(_row_ix, page_image)| {
                                 if let Some(page_image) = page_image {
-                                    img(page_image)
+                                    img(weak_image(&page_image))
                                         .object_fit(ObjectFit::Cover)
                                         .max_w(window.viewport_size().width)
                                         .image_cache(&view.disabled_cache)
