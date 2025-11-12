@@ -51,4 +51,4 @@ winresource = "0.1.20" # Embed version and executable icon on Windows
 
 [profile.dev.package."*"]
 # Set the default for dependencies in Development mode.
-# opt-level = 3
+opt-level = 3

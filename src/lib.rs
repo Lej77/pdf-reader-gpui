@@ -1,15 +1,4 @@
-use gpui::{
-    AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
-    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, Task, WeakEntity, size,
-};
-use std::alloc::{GlobalAlloc, Layout};
-use std::any::Any;
-use std::cell::RefCell;
-use std::ops::Range;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::rc::Rc;
-
+mod allocator;
 pub mod assets;
 pub mod elm;
 pub mod prompt;
@@ -23,149 +12,26 @@ use gpui::{
     App, AppContext, Application, Context, IntoElement, ObjectFit, ParentElement, Render, Size,
     Styled, Window, WindowOptions, div, img, px,
 };
+use gpui::{
+    AsyncWindowContext, Entity, FocusHandle, ImageCacheError, InteractiveElement, KeyBinding,
+    Pixels, RenderImage, Resource, ScrollHandle, SharedString, StyledImage, Task, WeakEntity, size,
+};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
 use image::{Frame, RgbaImage};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
 #[cfg(feature = "mimalloc")]
-use mimalloc::MiMalloc as FallbackAllocator;
 // #[global_allocator]
-// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(not(feature = "mimalloc"))]
-use std::alloc::System as FallbackAllocator;
-use std::backtrace::Backtrace;
-
-#[global_allocator]
-static GLOBAL: ThreadLocalAlloc<FallbackAllocator> =
-    unsafe { ThreadLocalAlloc::new(FallbackAllocator) };
-
-trait CurrentGlobalAlloc: GlobalAlloc + Any {}
-impl<T: GlobalAlloc + Any> CurrentGlobalAlloc for T {}
-
-thread_local! {
-    static CURRNET_ALLOCATOR: RefCell<Option<&'static dyn CurrentGlobalAlloc>> = const { RefCell::new(None) };
-}
-static ENABLED_THREAD_LOCAL_ALLOC: AtomicBool = AtomicBool::new(false);
-struct ThreadLocalAlloc<T> {
-    fallback: T,
-}
-impl<T> ThreadLocalAlloc<T> {
-    pub const unsafe fn new(fallback: T) -> Self {
-        Self { fallback }
-    }
-}
-unsafe impl<T: GlobalAlloc> GlobalAlloc for ThreadLocalAlloc<T> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ENABLED_THREAD_LOCAL_ALLOC.load(Relaxed)
-            && let Ok(Some(memory)) = CURRNET_ALLOCATOR.try_with(|global| {
-                global
-                    .borrow()
-                    .as_ref()
-                    .map(|alloc| unsafe { alloc.alloc(layout) })
-            })
-        {
-            memory
-        } else {
-            unsafe { self.fallback.alloc(layout) }
-        }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ENABLED_THREAD_LOCAL_ALLOC.load(Relaxed)
-            && let Ok(Some(())) = CURRNET_ALLOCATOR.try_with(|global| {
-                global
-                    .borrow()
-                    .as_ref()
-                    .map(|alloc| unsafe { alloc.dealloc(ptr, layout) })
-            })
-        {
-            // done
-        } else {
-            unsafe { self.fallback.dealloc(ptr, layout) }
-        }
-    }
-}
-
-struct BulkFreeAllocItem {
-    ptr: *mut u8,
-    layout: Layout,
-    backtrace: Backtrace,
-}
-struct BulkFreeAlloc<'a> {
-    allocations: RefCell<Vec<BulkFreeAllocItem>>,
-    allocator: &'a dyn GlobalAlloc,
-}
-impl<'a> BulkFreeAlloc<'a> {
-    pub const unsafe fn new(allocator: &'a dyn GlobalAlloc) -> Self {
-        Self {
-            allocations: RefCell::new(Vec::new()),
-            allocator,
-        }
-    }
-    pub fn forget(&self, ptr: *mut u8) {
-        let mut allocations = self.allocations.borrow_mut();
-        allocations.retain(|item| !std::ptr::addr_eq(item.ptr, ptr));
-    }
-    #[expect(unused)]
-    pub fn free_all(&self) {
-        let allocations = std::mem::take(&mut *self.allocations.borrow_mut());
-
-        for item in allocations {
-            unsafe { self.allocator.dealloc(item.ptr, item.layout) };
-        }
-    }
-    pub fn forget_and_warn_all(&self) {
-        let allocations = std::mem::take(&mut *self.allocations.borrow_mut());
-        if !allocations.is_empty() {
-            log::error!(
-                "\n\n\n\nThere was {} allocations leaked\n\n\n\n",
-                allocations.len()
-            );
-        }
-        for item in allocations {
-            log::error!(
-                "\nMemory leak with layout {:?} at: {}\n\n",
-                item.layout,
-                item.backtrace
-            );
-        }
-    }
-}
-unsafe impl GlobalAlloc for BulkFreeAlloc<'_> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { self.allocator.alloc(layout) };
-
-        let Ok(mut allocations) = self.allocations.try_borrow_mut() else {
-            // Allocating for Backtrace or Vec<BulkFreeAllocItem>:
-            return ptr;
-        };
-        let backtrace = Backtrace::force_capture();
-
-        allocations.push(BulkFreeAllocItem {
-            ptr,
-            layout,
-            backtrace,
-        });
-
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if let Ok(mut allocations) = self.allocations.try_borrow_mut() {
-            allocations.retain(|item| !std::ptr::addr_eq(item.ptr, ptr));
-        }
-
-        unsafe { self.allocator.dealloc(ptr, layout) };
-    }
-}
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// This type is the same as [`RenderSettings`] except it implements more traits.
 #[derive(Clone, Copy, PartialEq)]
@@ -517,43 +383,34 @@ impl PdfPageCache {
 
         // FIXME: hayro::render leaks memory so as a workaround try overriding the allocator to one that can bulk free all its memory.
 
-        ENABLED_THREAD_LOCAL_ALLOC.store(true, Relaxed);
-        thread_local! {
-            static BULK_ALLOC: BulkFreeAlloc = const {unsafe { BulkFreeAlloc::new(&FallbackAllocator) }};
+        let (width, height, mut data) =
+            allocator::ThreadLocalAlloc::with_no_leaks(|leak_detector| {
+                let pdf = Pdf::new(pdf_data).unwrap();
+                let page = &pdf.pages()[index];
+                let pixmap = render(page, &interpreter_settings, &render_settings);
+                drop(pdf);
+
+                // The code below that converts to RenderImage was inspired by code from:
+                // <gpui::ImageDecoder as Asset>::load
+                //
+                // The more "normal" way to convert it would be using:
+                // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
+
+                let width = u32::from(pixmap.width());
+                let height = u32::from(pixmap.height());
+                let mut data = pixmap.take_u8();
+                leak_detector.forget(data.as_mut_ptr());
+                (width, height, data)
+            });
+
+        // Convert from RGBA to BGRA.
+        for pixel in data.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
         }
-        BULK_ALLOC.with(|bulk_alloc| {
-            let bulk_alloc: &'static BulkFreeAlloc = unsafe { &*(bulk_alloc as *const _) };
-            #[cfg(feature = "bulk-free-alloc")]
-            CURRNET_ALLOCATOR.set(Some(bulk_alloc));
 
-            let pdf = Pdf::new(pdf_data).unwrap();
-            let page = &pdf.pages()[index];
-            let pixmap = render(page, &interpreter_settings, &render_settings);
-            drop(pdf);
-            CURRNET_ALLOCATOR.set(None);
-
-            // The code below that converts to RenderImage was inspired by code from:
-            // <gpui::ImageDecoder as Asset>::load
-            //
-            // The more "normal" way to convert it would be using:
-            // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
-
-            let width = u32::from(pixmap.width());
-            let height = u32::from(pixmap.height());
-            let mut data = pixmap.take_u8();
-
-            bulk_alloc.forget(data.as_mut_ptr());
-            bulk_alloc.forget_and_warn_all();
-
-            // Convert from RGBA to BGRA.
-            for pixel in data.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-
-            let image_data =
-                RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
-            Arc::new(RenderImage::new([Frame::new(image_data)]))
-        })
+        let image_data =
+            RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
+        Arc::new(RenderImage::new([Frame::new(image_data)]))
     }
 
     pub fn clear(&self) {
@@ -671,8 +528,7 @@ impl Render for PdfPages {
                             .zip(view.pdf_page_cache.get_images(visible_range, window, cx))
                             .map(|(_row_ix, page_image)| {
                                 if let Some(page_image) = page_image {
-                                    img(page_image)
-                                        .object_fit(ObjectFit::Cover)
+                                    img(page_image).object_fit(ObjectFit::Cover)
                                         .max_w(window.viewport_size().width)
                                         .image_cache(&view.disabled_cache)
                                         //.w(px(page.media_box().width() as f32))
@@ -941,29 +797,31 @@ pub fn start_gui() {
     // let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     // let _rt_guard = rt.enter();
 
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
-        cx.new(|cx: &mut Context<'_, ()>| {
-            // This must be called before using any GPUI Component features.
-            gpui_component::init(cx);
+    allocator::ThreadLocalAlloc::with_no_leaks(|_leak_detector| {
+        Application::new().with_assets(Assets).run(|cx: &mut App| {
+            cx.new(|cx: &mut Context<'_, ()>| {
+                // This must be called before using any GPUI Component features.
+                gpui_component::init(cx);
 
-            cx.open_window(
-                WindowOptions {
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("GPUI PDF Reader".into()),
+                cx.open_window(
+                    WindowOptions {
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("GPUI PDF Reader".into()),
+                            ..Default::default()
+                        }),
+                        window_min_size: Some(Size::new(px(400.), px(400.))),
                         ..Default::default()
-                    }),
-                    window_min_size: Some(Size::new(px(400.), px(400.))),
-                    ..Default::default()
-                },
-                |window: &mut Window, cx: &mut App| {
-                    // Uncomment next line to test a specific theme instead of using the system theme:
-                    // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
+                    },
+                    |window: &mut Window, cx: &mut App| {
+                        // Uncomment next line to test a specific theme instead of using the system theme:
+                        // gpui_component::Theme::change(gpui_component::ThemeMode::Light, Some(window), cx);
 
-                    let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
-                    cx.new(|cx| Root::new(main_ui.into(), window, cx))
-                },
-            )
-            .expect("Failed to build and open window");
+                        let main_ui = cx.new(|cx: &mut Context<'_, _>| PdfReader::new(window, cx));
+                        cx.new(|cx| Root::new(main_ui.into(), window, cx))
+                    },
+                )
+                .expect("Failed to build and open window");
+            });
         });
     });
 }
