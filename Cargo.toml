@@ -7,12 +7,12 @@ license = "Apache-2.0"
 repository = "https://github.com/Lej77/pdf-reader-gpui"
 
 [features]
-default = []
+default = ["bulk-free-alloc"]
 
 pdf-js = ["gpui-component/webview", "dep:wry"] # TODO: support PDF.js, maybe adapt code from https://github.com/dmanuel64/leptos-pdf
 mimalloc = ["dep:mimalloc"]
 
-bulk-free-alloc = [] # Force free all memory used by hayro
+bulk-free-alloc = [] # Check that all memory used by hayro is freed
 
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-alloc-bytes-total = ["hotpath/hotpath-alloc-bytes-total"]
@@ -51,4 +51,4 @@ winresource = "0.1.20" # Embed version and executable icon on Windows
 
 [profile.dev.package."*"]
 # Set the default for dependencies in Development mode.
-opt-level = 3
+# opt-level = 3

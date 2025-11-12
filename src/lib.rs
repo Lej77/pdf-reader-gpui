@@ -27,7 +27,6 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
 use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
-use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -42,6 +41,7 @@ use mimalloc::MiMalloc as FallbackAllocator;
 
 #[cfg(not(feature = "mimalloc"))]
 use std::alloc::System as FallbackAllocator;
+use std::backtrace::Backtrace;
 
 #[global_allocator]
 static GLOBAL: ThreadLocalAlloc<FallbackAllocator> =
@@ -94,61 +94,74 @@ unsafe impl<T: GlobalAlloc> GlobalAlloc for ThreadLocalAlloc<T> {
     }
 }
 
+struct BulkFreeAllocItem {
+    ptr: *mut u8,
+    layout: Layout,
+    backtrace: Backtrace,
+}
 struct BulkFreeAlloc<'a> {
-    allocations: RefCell<(usize, [(*mut u8, Layout); 1024 * 1024])>,
+    allocations: RefCell<Vec<BulkFreeAllocItem>>,
     allocator: &'a dyn GlobalAlloc,
 }
 impl<'a> BulkFreeAlloc<'a> {
-    const EMPTY_SLOT: (*mut u8, Layout) = (std::ptr::null_mut(), unsafe {
-        Layout::from_size_align_unchecked(0, 2)
-    });
     pub const unsafe fn new(allocator: &'a dyn GlobalAlloc) -> Self {
         Self {
-            allocations: RefCell::new((0, [Self::EMPTY_SLOT; _])),
+            allocations: RefCell::new(Vec::new()),
             allocator,
         }
     }
     pub fn forget(&self, ptr: *mut u8) {
         let mut allocations = self.allocations.borrow_mut();
-        let allocations = &mut *allocations;
-        for (index, slot) in allocations.1.iter_mut().enumerate().take(allocations.0).rev() {
-            if std::ptr::eq(slot.0, ptr) {
-                *slot = Self::EMPTY_SLOT;
-                if index + 1 == allocations.0 {
-                    allocations.0 = index;
-                }
-                break;
-            }
+        allocations.retain(|item| !std::ptr::addr_eq(item.ptr, ptr));
+    }
+    #[expect(unused)]
+    pub fn free_all(&self) {
+        let allocations = std::mem::take(&mut *self.allocations.borrow_mut());
+
+        for item in allocations {
+            unsafe { self.allocator.dealloc(item.ptr, item.layout) };
         }
     }
-    pub fn free_all(&self) {
-        let mut allocations = self.allocations.borrow_mut();
-        let allocations = &mut *allocations;
-
-        for (_index, slot) in allocations.1.iter_mut().enumerate().take(allocations.0) {
-            if !slot.0.is_null() {
-                unsafe { self.allocator.dealloc(slot.0, slot.1) };
-                *slot = Self::EMPTY_SLOT;
-            }
+    pub fn forget_and_warn_all(&self) {
+        let allocations = std::mem::take(&mut *self.allocations.borrow_mut());
+        if !allocations.is_empty() {
+            log::error!(
+                "\n\n\n\nThere was {} allocations leaked\n\n\n\n",
+                allocations.len()
+            );
         }
-        allocations.0 = 0;
+        for item in allocations {
+            log::error!(
+                "\nMemory leak with layout {:?} at: {}\n\n",
+                item.layout,
+                item.backtrace
+            );
+        }
     }
 }
 unsafe impl GlobalAlloc for BulkFreeAlloc<'_> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { self.allocator.alloc(layout) };
-        {
-            let mut allocations = self.allocations.borrow_mut();
-            let  allocations = &mut *allocations;
-            allocations.1[allocations.0].0 = ptr;
-            allocations.1[allocations.0].1 = layout;
-            allocations.0 += 1;
-        }
+
+        let Ok(mut allocations) = self.allocations.try_borrow_mut() else {
+            // Allocating for Backtrace or Vec<BulkFreeAllocItem>:
+            return ptr;
+        };
+        let backtrace = Backtrace::force_capture();
+
+        allocations.push(BulkFreeAllocItem {
+            ptr,
+            layout,
+            backtrace,
+        });
+
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.forget(ptr);
+        if let Ok(mut allocations) = self.allocations.try_borrow_mut() {
+            allocations.retain(|item| !std::ptr::addr_eq(item.ptr, ptr));
+        }
 
         unsafe { self.allocator.dealloc(ptr, layout) };
     }
@@ -251,7 +264,7 @@ struct PdfPageCacheMutableState {
     /// Settings (zoom) that will be used when rendering images.
     render_settings: RenderSettings2,
     /// The parsed PDF file that the background thread will rasterize.
-    pdf: Option<Arc<Pdf>>,
+    pdf: Option<Arc<Vec<u8>>>,
     /// Notify/wake the foreground future so that it can request a re-render of the UI with newly
     /// cached images.
     wake_future: Option<Waker>,
@@ -263,10 +276,11 @@ struct PdfPageCacheMutableState {
     should_quit: bool,
 }
 impl PdfPageCacheMutableState {
-    pub fn set_new_pdf(&mut self, pdf: Option<Arc<Pdf>>, render_settings: RenderSettings2) {
+    pub fn set_new_pdf(&mut self, pdf: Option<Arc<Vec<u8>>>, render_settings: RenderSettings2) {
         self.images.clear(); // <- always clear to ensure all items are None.
         if let Some(pdf) = pdf.as_ref() {
-            self.images.resize_with(pdf.pages().len(), || None);
+            self.images
+                .resize_with(Pdf::new(pdf.clone()).unwrap().pages().len(), || None);
         }
         self.requested_pages = 0..0;
         self.acknowledged_pages = 0..0;
@@ -327,7 +341,11 @@ impl PdfPageCache {
             pages_this_frame: 0..0,
             pages_last_frame: 0..0,
         };
-        std::thread::spawn(move || Self::background_work(shared));
+        std::thread::Builder::new()
+            .name("PDF Rasterizer".to_string())
+            .stack_size(1024 * 1024 * 20)
+            .spawn(move || Self::background_work(shared))
+            .unwrap();
 
         this
     }
@@ -448,7 +466,8 @@ impl PdfPageCache {
                 // render while not holding the lock:
                 drop(guard);
                 let new_image = Self::rasterize_pdf_page(
-                    &pdf.pages()[index],
+                    pdf.clone(),
+                    index,
                     &RenderSettings::from(render_settings),
                 );
 
@@ -489,7 +508,11 @@ impl PdfPageCache {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn rasterize_pdf_page(page: &Page, render_settings: &RenderSettings) -> Arc<RenderImage> {
+    fn rasterize_pdf_page(
+        pdf_data: Arc<Vec<u8>>,
+        index: usize,
+        render_settings: &RenderSettings,
+    ) -> Arc<RenderImage> {
         let interpreter_settings = InterpreterSettings::default();
 
         // FIXME: hayro::render leaks memory so as a workaround try overriding the allocator to one that can bulk free all its memory.
@@ -502,7 +525,11 @@ impl PdfPageCache {
             let bulk_alloc: &'static BulkFreeAlloc = unsafe { &*(bulk_alloc as *const _) };
             #[cfg(feature = "bulk-free-alloc")]
             CURRNET_ALLOCATOR.set(Some(bulk_alloc));
+
+            let pdf = Pdf::new(pdf_data).unwrap();
+            let page = &pdf.pages()[index];
             let pixmap = render(page, &interpreter_settings, &render_settings);
+            drop(pdf);
             CURRNET_ALLOCATOR.set(None);
 
             // The code below that converts to RenderImage was inspired by code from:
@@ -516,7 +543,7 @@ impl PdfPageCache {
             let mut data = pixmap.take_u8();
 
             bulk_alloc.forget(data.as_mut_ptr());
-            bulk_alloc.free_all();
+            bulk_alloc.forget_and_warn_all();
 
             // Convert from RGBA to BGRA.
             for pixel in data.chunks_exact_mut(4) {
@@ -532,7 +559,7 @@ impl PdfPageCache {
     pub fn clear(&self) {
         self.set_new_pdf(None, RenderSettings2::default());
     }
-    pub fn set_new_pdf(&self, pdf: Option<Arc<Pdf>>, render_settings: RenderSettings2) {
+    pub fn set_new_pdf(&self, pdf: Option<Arc<Vec<u8>>>, render_settings: RenderSettings2) {
         let mut guard = self.shared.state.lock().unwrap();
         guard.set_new_pdf(pdf, render_settings);
     }
@@ -758,7 +785,7 @@ impl PdfReader {
             // Update image rendering:
             pages
                 .pdf_page_cache
-                .set_new_pdf(Some(pdf.clone()), render_settings.into());
+                .set_new_pdf(Some(tab_data.pdf_data.clone()), render_settings.into());
 
             // Update layout/sizes:
             self.assumed_viewport_size = viewport_size;
