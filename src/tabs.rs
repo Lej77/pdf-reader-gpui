@@ -73,6 +73,8 @@ impl<T> TabsView<T> {
                 self.tabs.remove(index);
                 if self.active_tab == index {
                     self.set_active_tab(index, window, cx);
+                } else if index < self.active_tab {
+                    self.active_tab -= 1;
                 }
             }
         }
@@ -190,10 +192,30 @@ impl<T: TabData> Render for TabsView<T> {
                 } else {
                     "New tab".into()
                 })
+                .child(
+                    // Non-close button area:
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .left_0()
+                        .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
+                            if let MouseDownEvent {
+                                button: MouseButton::Middle,
+                                ..
+                            } = event
+                            {
+                                view.remove_tab(tab_index, window, cx);
+                                view.scroll_to_active_tab(window, cx);
+                            }
+                        })),
+                )
                 .suffix(
                     Button::new("button-close-tab")
                         .icon(Icon::new(IconName::Close))
                         .on_click(cx.listener(move |view, _event, window, cx| {
+                            cx.stop_propagation();
                             view.remove_tab(tab_index, window, cx);
                             view.scroll_to_active_tab(window, cx);
                         }))
@@ -202,20 +224,11 @@ impl<T: TabData> Render for TabsView<T> {
                 )
                 .when_some(tab_data.as_ref(), |this, full_path| {
                     this.tooltip({
-                        let full_path = SharedString::from(format!("{}", full_path.full_path().display()));
+                        let full_path =
+                            SharedString::from(format!("{}", full_path.full_path().display()));
                         move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)
                     })
                 })
-                .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
-                    if let MouseDownEvent {
-                        button: MouseButton::Middle,
-                        ..
-                    } = event
-                    {
-                        view.remove_tab(tab_index, window, cx);
-                        view.scroll_to_active_tab(window, cx);
-                    }
-                }))
             }));
 
         div()
