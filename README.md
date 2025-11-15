@@ -19,6 +19,7 @@ The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive
   - [GPUI Component](https://longbridge.github.io/gpui-component/)
     - [GitHub](https://github.com/longbridge/gpui-component)
     - [docs.rs](https://docs.rs/gpui-component/latest/gpui_component/)
+    - [longbridge/gpui-component | DeepWiki](https://deepwiki.com/longbridge/gpui-component)
 - PDF
   - [`mupdf` -  Safe Rust wrapper to MuPDF ](https://crates.io/crates/mupdf/0.5.0)
     - Used by `miro`, `tdf` and `MView6`.
