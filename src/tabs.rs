@@ -86,12 +86,18 @@ impl SmoothScrollState {
         self.requested_async_scroll = 2;
     }
     /// Start animation if target offset has changed.
-    pub fn noticed_scroll(&mut self, scroll_handle: &ScrollHandle) {
+    pub fn noticed_scroll<T: 'static>(
+        &mut self,
+        scroll_handle: &ScrollHandle,
+        _window: &mut Window,
+        cx: &mut Context<T>,
+    ) {
         let current_offset = Self::bound_scroll(scroll_handle, scroll_handle.offset());
         let diff = self.last_set_offset - current_offset;
         if diff.x.abs() > px(2.) || diff.y.abs() > px(2.) {
             self.start_offset = self.wanted_offset();
             self.start_scroll_to(current_offset);
+            cx.notify();
         }
     }
     /// Assume that the offset was changed relative to the last set offset.
@@ -177,8 +183,10 @@ impl SmoothScrollState {
     ) {
         if self.requested_async_scroll > 0 {
             self.requested_async_scroll -= 1;
-            self.noticed_scroll(scroll_handle);
-            window.request_animation_frame();
+            self.noticed_scroll(scroll_handle, window, cx);
+            if self.requested_async_scroll > 0 {
+                window.request_animation_frame();
+            }
         }
         // Update animation if active
         if self.animating {
@@ -253,16 +261,16 @@ impl<T> TabsView<T> {
         (self.on_tab_changed)(window, cx);
     }
 
-    pub fn scroll_to_active_tab(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    pub fn scroll_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             self.scroll_handle.set_offset(Point::default());
-            self.smooth_scroll.noticed_scroll(&self.scroll_handle);
+            self.smooth_scroll.noticed_scroll(&self.scroll_handle, window, cx);
         } else {
             self.scroll_handle.scroll_to_item(self.active_tab); // <- updates the scroll offset later
-        }
 
-        // We need to get the scroll offset when it becomes available next frame:
-        self.smooth_scroll.requested_async_scroll();
+            // We need to get the scroll offset when it becomes available next frame:
+            self.smooth_scroll.requested_async_scroll();
+        }
     }
     pub fn active_tab(&self) -> usize {
         self.active_tab
@@ -327,14 +335,18 @@ impl Render for DragTab {
             .py_1()
             .px_3()
             .border_2()
-            .border_color(cx.theme().drag_border)
-            .text_color(cx.theme().foreground)
+            .whitespace_nowrap()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .text_color(cx.theme().tab_foreground)
+            .bg(cx.theme().tab_active)
+            .opacity(0.75)
             .child(self.label.clone())
     }
 }
 impl<T: TabData> Render for TabsView<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.smooth_scroll.noticed_scroll(&self.scroll_handle);
+        self.smooth_scroll.noticed_scroll(&self.scroll_handle, window, cx);
         self.smooth_scroll
             .preform_scroll(&self.scroll_handle, window, cx);
 
@@ -371,6 +383,7 @@ impl<T: TabData> Render for TabsView<T> {
                     "New tab".into()
                 };
                 Tab::new(label.clone())
+                    .rounded(cx.theme().radius)
                     .on_drag(
                         DragTab {
                             index: tab_index,
@@ -391,6 +404,8 @@ impl<T: TabData> Render for TabsView<T> {
                             view.active_tab = tab_index;
                         } else if view.active_tab > drag.index && view.active_tab <= tab_index {
                             view.active_tab -= 1;
+                        } else if view.active_tab < drag.index && view.active_tab >= tab_index {
+                            view.active_tab += 1;
                         }
                         cx.notify();
                     }))
