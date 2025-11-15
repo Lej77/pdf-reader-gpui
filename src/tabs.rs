@@ -1,13 +1,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AlignItems, Context, Empty, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window, div, point, px,
+    AlignItems, AppContext, Context, Empty, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, point, px,
 };
 use gpui_component::button::Button;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{Icon, IconName, StyledExt};
+use gpui_component::{ActiveTheme, Icon, IconName, StyledExt};
 use std::cmp::Ordering;
 use std::ops::Sub;
 use std::path::PathBuf;
@@ -310,6 +310,28 @@ impl<T> TabsView<T> {
         cx.notify();
     }
 }
+
+/// Payload for `on_drag` event.
+#[derive(Debug, Clone)]
+struct DragTab {
+    /// Index of the dragged tab.
+    index: usize,
+    /// Label of the dragged tab.
+    label: SharedString,
+}
+impl Render for DragTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("drag-tab")
+            .cursor_grab()
+            .py_1()
+            .px_3()
+            .border_2()
+            .border_color(cx.theme().drag_border)
+            .text_color(cx.theme().foreground)
+            .child(self.label.clone())
+    }
+}
 impl<T: TabData> Render for TabsView<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.smooth_scroll.noticed_scroll(&self.scroll_handle);
@@ -343,46 +365,70 @@ impl<T: TabData> Render for TabsView<T> {
                 view.scroll_to_active_tab(window, cx);
             }))
             .children(self.tabs.iter().enumerate().map(|(tab_index, tab_data)| {
-                Tab::new(if let Some(tab_data) = tab_data {
+                let label = if let Some(tab_data) = tab_data {
                     tab_data.label()
                 } else {
                     "New tab".into()
-                })
-                .child(
-                    // Non-close button area:
-                    div()
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .right_0()
-                        .left_0()
-                        .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
-                            if let MouseDownEvent {
-                                button: MouseButton::Middle,
-                                ..
-                            } = event
-                            {
-                                view.remove_tab(tab_index, window, cx);
-                            }
-                        })),
-                )
-                .suffix(
-                    Button::new("button-close-tab")
-                        .icon(Icon::new(IconName::Close))
-                        .on_click(cx.listener(move |view, _event, window, cx| {
+                };
+                Tab::new(label.clone())
+                    .on_drag(
+                        DragTab {
+                            index: tab_index,
+                            label: label.clone(),
+                        },
+                        |drag, _, _, cx| {
                             cx.stop_propagation();
-                            view.remove_tab(tab_index, window, cx);
-                        }))
-                        .max_w_6()
-                        .max_h_6(),
-                )
-                .when_some(tab_data.as_ref(), |this, full_path| {
-                    this.tooltip({
-                        let full_path =
-                            SharedString::from(format!("{}", full_path.full_path().display()));
-                        move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)
+                            cx.new(|_| drag.clone())
+                        },
+                    )
+                    .drag_over::<DragTab>(|this, _, _, cx| {
+                        this.border_l_2().border_color(cx.theme().drag_border)
                     })
-                })
+                    .on_drop(cx.listener(move |view, drag: &DragTab, _window, cx| {
+                        let tab = view.tabs.remove(drag.index);
+                        view.tabs.insert(tab_index, tab);
+                        if view.active_tab == drag.index {
+                            view.active_tab = tab_index;
+                        } else if view.active_tab > drag.index && view.active_tab <= tab_index {
+                            view.active_tab -= 1;
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        // Non-close button area:
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .left_0()
+                            .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
+                                if let MouseDownEvent {
+                                    button: MouseButton::Middle,
+                                    ..
+                                } = event
+                                {
+                                    view.remove_tab(tab_index, window, cx);
+                                }
+                            })),
+                    )
+                    .suffix(
+                        Button::new("button-close-tab")
+                            .icon(Icon::new(IconName::Close))
+                            .on_click(cx.listener(move |view, _event, window, cx| {
+                                cx.stop_propagation();
+                                view.remove_tab(tab_index, window, cx);
+                            }))
+                            .max_w_6()
+                            .max_h_6(),
+                    )
+                    .when_some(tab_data.as_ref(), |this, full_path| {
+                        this.tooltip({
+                            let full_path =
+                                SharedString::from(format!("{}", full_path.full_path().display()));
+                            move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)
+                        })
+                    })
             }));
 
         div()
