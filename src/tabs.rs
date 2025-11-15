@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder;
 use gpui::{
     AlignItems, Context, Empty, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
@@ -199,17 +200,11 @@ impl<T: TabData> Render for TabsView<T> {
                         .max_w_6()
                         .max_h_6(),
                 )
-                .tooltip({
-                    let full_path = tab_data
-                        .as_ref()
-                        .map(|d| SharedString::from(format!("{}", d.full_path().display())));
-                    move |window, cx| {
-                        if full_path.is_none() {
-                            Tooltip::element(|_window, _cx| Empty).build(window, cx)
-                        } else {
-                            Tooltip::new(full_path.clone().unwrap_or_default()).build(window, cx)
-                        }
-                    }
+                .when_some(tab_data.as_ref(), |this, full_path| {
+                    this.tooltip({
+                        let full_path = SharedString::from(format!("{}", full_path.full_path().display()));
+                        move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)
+                    })
                 })
                 .on_any_mouse_down(cx.listener(move |view, event, window, cx| {
                     if let MouseDownEvent {
