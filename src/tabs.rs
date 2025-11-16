@@ -48,6 +48,7 @@ pub struct SmoothScrollState {
     /// [`ScrollHandle::scroll_to_item`]. These don't set the offset until 2 frames after
     /// requested so we need to request a new update then to get and override that new offset.
     requested_async_scroll: u32,
+    requested_scroll_to_item: Option<usize>,
 }
 impl SmoothScrollState {
     pub fn new() -> Self {
@@ -59,6 +60,7 @@ impl SmoothScrollState {
             start_time: Instant::now(),
             duration: Duration::from_millis(1500),
             requested_async_scroll: 0,
+            requested_scroll_to_item: None,
         }
     }
 
@@ -81,6 +83,47 @@ impl SmoothScrollState {
         )
     }
 
+    /// Scrolls the minimal amount to either ensure that the child is
+    /// fully visible or the top element of the view depends on the
+    /// scroll strategy
+    pub fn scroll_to_item<T: 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        scroll_handle: &ScrollHandle,
+        index: usize,
+    ) {
+        if let Some(bounds) = scroll_handle
+            .bounds_for_item(index)
+            .filter(|item| !item.is_empty())
+        {
+            let mut scroll_offset = scroll_handle.offset();
+            let all_bounds = scroll_handle.bounds();
+
+            if bounds.top() + scroll_offset.y < all_bounds.top() {
+                scroll_offset.y = all_bounds.top() - bounds.top();
+            } else if bounds.bottom() + scroll_offset.y > all_bounds.bottom() {
+                scroll_offset.y = all_bounds.bottom() - bounds.bottom();
+            }
+
+            if bounds.left() + scroll_offset.x < all_bounds.left() {
+                scroll_offset.x = all_bounds.left() - bounds.left();
+            } else if bounds.right() + scroll_offset.x > all_bounds.right() {
+                scroll_offset.x = all_bounds.right() - bounds.right();
+            }
+
+            scroll_handle.set_offset(scroll_offset);
+            self.noticed_scroll(window, cx, scroll_handle);
+        } else {
+            // Item is new and hasn't been created yet:
+            self.requested_scroll_to_item = Some(index);
+            // Prevent infinite re-checking (we only try while requested_async_scroll is above 0.
+            if self.requested_async_scroll == 0 {
+                self.requested_async_scroll = 2;
+            }
+        }
+    }
+
     /// Indicate that the newly set scroll offset is where we actually want to scroll.
     pub fn requested_async_scroll(&mut self) {
         self.requested_async_scroll = 2;
@@ -88,9 +131,9 @@ impl SmoothScrollState {
     /// Start animation if target offset has changed.
     pub fn noticed_scroll<T: 'static>(
         &mut self,
-        scroll_handle: &ScrollHandle,
         _window: &mut Window,
         cx: &mut Context<T>,
+        scroll_handle: &ScrollHandle,
     ) {
         let current_offset = Self::bound_scroll(scroll_handle, scroll_handle.offset());
         let diff = self.last_set_offset - current_offset;
@@ -103,9 +146,9 @@ impl SmoothScrollState {
     /// Assume that the offset was changed relative to the last set offset.
     pub fn noticed_scroll_wheel_event<T: 'static>(
         &mut self,
-        scroll_handle: &ScrollHandle,
         _window: &mut Window,
         _cx: &mut Context<T>,
+        scroll_handle: &ScrollHandle,
     ) {
         let current_offset = Self::bound_scroll(&scroll_handle, scroll_handle.offset());
 
@@ -177,16 +220,22 @@ impl SmoothScrollState {
 
     pub fn preform_scroll<T: 'static>(
         &mut self,
-        scroll_handle: &ScrollHandle,
         window: &mut Window,
         cx: &mut Context<T>,
+        scroll_handle: &ScrollHandle,
     ) {
         if self.requested_async_scroll > 0 {
+            if let Some(index) = self.requested_scroll_to_item.take() {
+                self.scroll_to_item(window, cx, scroll_handle, index);
+            }
             self.requested_async_scroll -= 1;
-            self.noticed_scroll(scroll_handle, window, cx);
+            self.noticed_scroll(window, cx, scroll_handle);
             if self.requested_async_scroll > 0 {
                 window.request_animation_frame();
             }
+        } else {
+            // If we failed to scroll to the item for several frames, then forget about it:
+            self.requested_scroll_to_item = None;
         }
         // Update animation if active
         if self.animating {
@@ -264,12 +313,16 @@ impl<T> TabsView<T> {
     pub fn scroll_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == 0 {
             self.scroll_handle.set_offset(Point::default());
-            self.smooth_scroll.noticed_scroll(&self.scroll_handle, window, cx);
+            self.smooth_scroll
+                .noticed_scroll(window, cx, &self.scroll_handle);
         } else {
-            self.scroll_handle.scroll_to_item(self.active_tab); // <- updates the scroll offset later
+            self.smooth_scroll
+                .scroll_to_item(window, cx, &self.scroll_handle, self.active_tab);
 
+            // Previously used the inbuilt method:
+            // self.scroll_handle.scroll_to_item(self.active_tab); // <- updates the scroll offset later
             // We need to get the scroll offset when it becomes available next frame:
-            self.smooth_scroll.requested_async_scroll();
+            // self.smooth_scroll.requested_async_scroll();
         }
     }
     pub fn active_tab(&self) -> usize {
@@ -346,9 +399,10 @@ impl Render for DragTab {
 }
 impl<T: TabData> Render for TabsView<T> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.smooth_scroll.noticed_scroll(&self.scroll_handle, window, cx);
         self.smooth_scroll
-            .preform_scroll(&self.scroll_handle, window, cx);
+            .noticed_scroll(window, cx, &self.scroll_handle);
+        self.smooth_scroll
+            .preform_scroll(window, cx, &self.scroll_handle);
 
         let new_tab_button = if self.tabs.is_empty() {
             Empty.into_any_element()
@@ -495,9 +549,9 @@ impl<T: TabData> Render for TabsView<T> {
                                         }
                                     } else {
                                         view.smooth_scroll.noticed_scroll_wheel_event(
-                                            &view.scroll_handle,
                                             window,
                                             cx,
+                                            &view.scroll_handle,
                                         );
                                     }
                                 },
