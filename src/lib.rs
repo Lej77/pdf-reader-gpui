@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod elm;
+pub mod pdf;
 pub mod prompt;
 pub mod tabs;
 
@@ -16,9 +17,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
-use hayro::{InterpreterSettings, Pdf, RenderSettings, render};
-use hayro_syntax::page::Page;
-use image::{Frame, RgbaImage};
+use hayro::{InterpreterSettings, Pdf, RenderSettings};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -348,9 +347,10 @@ impl PdfPageCache {
 
                 // render while not holding the lock:
                 drop(guard);
-                let new_image = Self::rasterize_pdf_page(
+                let new_image = pdf::rasterize_pdf_page(
                     &pdf.pages()[index],
                     &RenderSettings::from(render_settings),
+                    &InterpreterSettings::default(),
                 );
 
                 // re-acquire lock and save new image to shared state:
@@ -387,31 +387,6 @@ impl PdfPageCache {
                 return;
             }
         }
-    }
-
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn rasterize_pdf_page(page: &Page, render_settings: &RenderSettings) -> Arc<RenderImage> {
-        let interpreter_settings = InterpreterSettings::default();
-
-        let pixmap = render(page, &interpreter_settings, &render_settings);
-        // The code below that converts to RenderImage was inspired by code from:
-        // <gpui::ImageDecoder as Asset>::load
-        //
-        // The more "normal" way to convert it would be using:
-        // Image::from_bytes(ImageFormat::Png, pixmap.take_png()).to_image_data(renderer)
-
-        let width = u32::from(pixmap.width());
-        let height = u32::from(pixmap.height());
-        let mut data = pixmap.take_u8();
-
-        // Convert from RGBA to BGRA.
-        for pixel in data.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-        }
-
-        let image_data =
-            RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
-        Arc::new(RenderImage::new([Frame::new(image_data)]))
     }
 
     pub fn clear(&self) {

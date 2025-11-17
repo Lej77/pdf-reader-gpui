@@ -4966,6 +4966,7 @@ dependencies = [
  "hayro-syntax",
  "hotpath",
  "image",
+ "kurbo 0.12.0",
  "lb-wry",
  "log",
  "mimalloc",
