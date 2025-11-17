@@ -1,15 +1,15 @@
 use gpui::RenderImage;
-use hayro::{RenderSettings, render};
+use hayro::{Pixmap, RenderSettings, render};
 use hayro_interpret::font::Glyph;
 use hayro_interpret::{
     ClipPath, Context, Device, FillRule, GlyphDrawMode, Image, InterpreterSettings, Paint,
     PathDrawMode, SoftMask, interpret,
 };
 use hayro_syntax::content::ops::TypedInstruction;
-use hayro_syntax::object::Rect;
+use hayro_syntax::object::{Object, Rect};
 use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
-use kurbo::{Affine, BezPath, Shape};
+use kurbo::{Affine, BezPath, Point, Shape};
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -21,6 +21,13 @@ pub fn rasterize_pdf_page(
     interpreter_settings: &InterpreterSettings,
 ) -> Arc<RenderImage> {
     let pixmap = render(page, interpreter_settings, render_settings);
+    Arc::new(pixmap_to_gpui_image(pixmap))
+}
+
+/// Convert a rendered PDF in the form of a [`Pixmap`] into a GPUI [`RenderImage`]. This conversion
+/// doesn't allocate but does need to traverse the whole image data buffer to convert colors from
+/// `RGBA` to `BGRA`.
+pub fn pixmap_to_gpui_image(pixmap: Pixmap) -> RenderImage {
     // The code below that converts to RenderImage was inspired by code from:
     // <gpui::ImageDecoder as Asset>::load
     //
@@ -37,16 +44,19 @@ pub fn rasterize_pdf_page(
     }
 
     let image_data = RgbaImage::from_raw(width, height, data).expect("incorrect image dimensions");
-    Arc::new(RenderImage::new([Frame::new(image_data)]))
+    RenderImage::new([Frame::new(image_data)])
 }
 
-pub struct PdfFeature {}
+pub enum PdfFeature {
+    Text { text: Vec<u8>, rect: Rect },
+}
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn extract_features(
     page: &Page,
     render_settings: &RenderSettings,
     interpreter_settings: &InterpreterSettings,
-) {
+) -> Vec<PdfFeature> {
     // Adapted from `hayro::render` but the device was changed to `FeatureExtractor` and some rendering code was removed.
 
     let (x_scale, y_scale) = (render_settings.x_scale, render_settings.y_scale);
@@ -68,10 +78,12 @@ pub fn extract_features(
         interpreter_settings.clone(),
     );
 
-    let current_op = Cell::new(None);
-    let mut device = FeatureExtractor {
-        _current_op: &current_op,
+    let mut output = Vec::new();
+    let shared = FeatureExtractorState {
+        current_op: Cell::new(None),
+        text_region: Cell::new(None),
     };
+    let mut device = FeatureExtractor { shared: &shared };
 
     device.push_clip_path(&ClipPath {
         path: initial_transform * page.intersected_crop_box().to_path(0.1),
@@ -83,7 +95,43 @@ pub fn extract_features(
     interpret(
         std::iter::from_fn(|| {
             let op = ops.next();
-            current_op.set(op.clone());
+            let prev = shared.current_op.replace(op.clone());
+            if let (Some(rect), Some(prev)) = (shared.text_region.take(), prev) {
+                let mut data = Vec::new();
+                match prev {
+                    TypedInstruction::NextLine(_)
+                    | TypedInstruction::NextLineAndSetLeading(_)
+                    | TypedInstruction::NextLineUsingLeading(_) => {
+                        data.push(b'\n');
+                    }
+                    TypedInstruction::ShowText(text) => {
+                        data.extend_from_slice(&*text.0.get());
+                    }
+                    TypedInstruction::NextLineAndShowText(text) => {
+                        data.push(b'\n');
+                        data.extend_from_slice(&*text.0.get());
+                    }
+                    TypedInstruction::ShowTextWithParameters(text) => {
+                        data.push(b'\n');
+                        data.extend_from_slice(&*text.2.get());
+                    }
+                    TypedInstruction::ShowTexts(texts) => {
+                        for obj in texts.0.iter::<Object>() {
+                            if let Some(_adjustment) = obj.clone().into_f32() {
+                            } else if let Some(text) = obj.into_string() {
+                                data.extend_from_slice(&*text.get());
+                            }
+                        }
+                    }
+                    _ => log::warn!(
+                        "show_glyph used for unexpected PDF operation --- {prev:?} --- {op:?}"
+                    ),
+                }
+
+                // log::trace!("{rect:?} --- {:?} --- {op:?}", String::from_utf8_lossy(&data));
+                output.push(PdfFeature::Text { rect, text: data });
+            }
+
             op
         }),
         resources,
@@ -92,6 +140,13 @@ pub fn extract_features(
     );
 
     device.pop_clip_path();
+
+    output
+}
+
+struct FeatureExtractorState<'pdf> {
+    current_op: Cell<Option<TypedInstruction<'pdf>>>,
+    text_region: Cell<Option<Rect>>,
 }
 
 /// A [`hayro_interpret::Device`] that is used as an "output" for PDF rendering.
@@ -100,7 +155,7 @@ pub fn extract_features(
 /// [`hayro-interpret/examples/extract_images.rs`](https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/examples/extract_images.rs)
 /// for a simpler example.
 struct FeatureExtractor<'out, 'pdf> {
-    _current_op: &'out Cell<Option<TypedInstruction<'pdf>>>,
+    shared: &'out FeatureExtractorState<'pdf>,
 }
 impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
     fn set_soft_mask(&mut self, _mask: Option<SoftMask<'a>>) {}
@@ -121,12 +176,26 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
     fn draw_glyph(
         &mut self,
         _glyph: &Glyph<'a>,
-        _transform: Affine,
-        _glyph_transform: Affine,
+        transform: Affine,
+        glyph_transform: Affine,
         _paint: &Paint<'a>,
         _draw_mode: &GlyphDrawMode,
     ) {
         // TODO: extract text location and symbol (check self.current_op)
+        // Text rasterization is done at:
+        // https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/src/interpret/text.rs#L11
+        // After each character in the string `apply_code_advance` is called:
+        // https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/src/interpret/state.rs#L145
+        let top_left = transform * glyph_transform * Point::new(0., 0.);
+        let bottom_right = transform * glyph_transform * Point::new(1., 1.);
+        let rect = Rect::from_points(top_left, bottom_right);
+        self.shared
+            .text_region
+            .set(Some(if let Some(prev) = self.shared.text_region.get() {
+                rect.union(prev)
+            } else {
+                rect
+            }));
     }
 
     fn draw_image(&mut self, _image: Image<'a, '_>, _transform: Affine) {
