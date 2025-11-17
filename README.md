@@ -10,6 +10,35 @@ The GUI is implemented using [`gpui`](https://www.gpui.rs/): "A fast, productive
 - Or download a precompiled executable from the [latest GitHub release](https://github.com/Lej77/pdf-reader-gpui/releases).
 - When developing use: `cargo run`
 
+### `cargo install`
+
+You can use `cargo install` to easily build from source without manually cloning the repo:
+
+```bash
+cargo install --git https://github.com/Lej77/pdf-reader-gpui.git
+```
+
+You can use [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) to easily download the precompiled executables from a GitHub release:
+
+```bash
+cargo binstall --git https://github.com/Lej77/pdf-reader-gpui.git pdf-reader-gpui
+```
+
+After installing you can update the program using [nabijaczleweli/cargo-update: A cargo subcommand for checking and applying updates to installed executables](https://github.com/nabijaczleweli/cargo-update):
+
+```bash
+cargo install-update --git pdf-reader-gpui
+
+# OR update all installed programs:
+cargo install-update --git --all
+```
+
+You can uninstall uisng:
+
+```bash
+ cargo uninstall pdf-reader-gpui
+```
+
 ## References
 
 - GUI
