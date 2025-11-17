@@ -641,23 +641,24 @@ impl PdfReader {
             };
             let pdf = Arc::new(pdf);
             if pdf.pages().is_empty() {
+                // no pages
                 return;
             }
             let viewport_size = window.viewport_size();
 
             // Scale to fit window width:
-            let base_width = pdf
+            let max_width = pdf
                 .pages()
                 .iter()
-                .map(|page| page.media_box().width() as f32)
+                .map(|page| page.render_dimensions().0)
                 .max_by(f32::total_cmp)
-                .expect("more than one page");
+                .expect("there should be at least one page");
             let viewport_width = f32::from(viewport_size.width);
-            let scale_x = viewport_width / base_width;
+            let scale = viewport_width / max_width;
 
             let render_settings = RenderSettings {
-                x_scale: scale_x,
-                y_scale: scale_x,
+                x_scale: scale,
+                y_scale: scale,
                 ..Default::default()
             };
 
@@ -672,9 +673,11 @@ impl PdfReader {
                 pdf.pages()
                     .iter()
                     .map(|page| {
-                        let width = page.media_box().width() as f32 * scale_x;
-                        let height = page.media_box().height() as f32 * scale_x;
-                        size(px(width), px(height))
+                        // Code adapted from `hayro::render`:
+                        let (width, height) = page.render_dimensions();
+                        let (width, height) = (width * scale, height * scale);
+
+                        size(px(width.floor()), px(height.floor()))
                     })
                     .collect::<Vec<_>>(),
             );
