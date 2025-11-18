@@ -10,17 +10,21 @@ use hayro_syntax::object::{Object, Rect};
 use hayro_syntax::page::Page;
 use image::{Frame, RgbaImage};
 use kurbo::{Affine, BezPath, Point, Shape};
+use std::borrow::Cow;
 use std::cell::Cell;
+use std::fmt;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 /// Rasterize a PDF page and convert the result from a [`hayro::Pixmap`] to a [`gpui::RenderImage`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn rasterize_pdf_page(
     page: &Page,
-    render_settings: &RenderSettings,
     interpreter_settings: &InterpreterSettings,
+    render_settings: &RenderSettings,
 ) -> Arc<RenderImage> {
     let pixmap = render(page, interpreter_settings, render_settings);
+    // extract_features(page, interpreter_settings, render_settings, &mut |feature| eprintln!("{feature:?}"));
     Arc::new(pixmap_to_gpui_image(pixmap))
 }
 
@@ -47,16 +51,43 @@ pub fn pixmap_to_gpui_image(pixmap: Pixmap) -> RenderImage {
     RenderImage::new([Frame::new(image_data)])
 }
 
-pub enum PdfFeature {
-    Text { text: Vec<u8>, rect: Rect },
+#[derive(Clone, PartialEq)]
+pub enum PdfFeature<'a> {
+    Text { text: Cow<'a, [u8]>, rect: Rect },
+}
+impl PdfFeature<'_> {
+    pub fn into_owned(self) -> PdfFeature<'static> {
+        match self {
+            PdfFeature::Text { text, rect } => PdfFeature::Text {
+                text: Cow::Owned(text.into_owned()),
+                rect,
+            },
+        }
+    }
+}
+impl fmt::Debug for PdfFeature<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PdfFeature::Text { text, rect } => f
+                .debug_struct("PdfFeature::Text")
+                .field(
+                    "text",
+                    //&String::from_utf16_lossy(&text.chunks_exact(2).map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>()),
+                    &String::from_utf8_lossy(&*text)
+                )
+                .field("rect", rect)
+                .finish(),
+        }
+    }
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn extract_features(
     page: &Page,
-    render_settings: &RenderSettings,
     interpreter_settings: &InterpreterSettings,
-) -> Vec<PdfFeature> {
+    render_settings: &RenderSettings,
+    handle_feature: &mut dyn FnMut(PdfFeature<'_>),
+) {
     // Adapted from `hayro::render` but the device was changed to `FeatureExtractor` and some rendering code was removed.
 
     let (x_scale, y_scale) = (render_settings.x_scale, render_settings.y_scale);
@@ -78,7 +109,6 @@ pub fn extract_features(
         interpreter_settings.clone(),
     );
 
-    let mut output = Vec::new();
     let shared = FeatureExtractorState {
         current_op: Cell::new(None),
         text_region: Cell::new(None),
@@ -90,6 +120,7 @@ pub fn extract_features(
         fill: FillRule::NonZero,
     });
 
+    let mut data = Vec::new();
     let resources = page.resources();
     let mut ops = page.typed_operations();
     interpret(
@@ -97,7 +128,7 @@ pub fn extract_features(
             let op = ops.next();
             let prev = shared.current_op.replace(op.clone());
             if let (Some(rect), Some(prev)) = (shared.text_region.take(), prev) {
-                let mut data = Vec::new();
+                data.clear();
                 match prev {
                     TypedInstruction::NextLine(_)
                     | TypedInstruction::NextLineAndSetLeading(_)
@@ -129,7 +160,10 @@ pub fn extract_features(
                 }
 
                 // log::trace!("{rect:?} --- {:?} --- {op:?}", String::from_utf8_lossy(&data));
-                output.push(PdfFeature::Text { rect, text: data });
+                handle_feature(PdfFeature::Text {
+                    rect,
+                    text: Cow::Borrowed(data.as_slice()),
+                });
             }
 
             op
@@ -140,8 +174,6 @@ pub fn extract_features(
     );
 
     device.pop_clip_path();
-
-    output
 }
 
 struct FeatureExtractorState<'pdf> {
@@ -181,7 +213,6 @@ impl<'a, 'out, 'pdf> Device<'a> for FeatureExtractor<'out, 'pdf> {
         _paint: &Paint<'a>,
         _draw_mode: &GlyphDrawMode,
     ) {
-        // TODO: extract text location and symbol (check self.current_op)
         // Text rasterization is done at:
         // https://github.com/LaurenzV/hayro/blob/e08071f8602c3e28000b4d114be41d08ee82b86b/hayro-interpret/src/interpret/text.rs#L11
         // After each character in the string `apply_code_advance` is called:

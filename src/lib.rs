@@ -349,8 +349,8 @@ impl PdfPageCache {
                 drop(guard);
                 let new_image = pdf::rasterize_pdf_page(
                     &pdf.pages()[index],
-                    &RenderSettings::from(render_settings),
                     &InterpreterSettings::default(),
+                    &RenderSettings::from(render_settings),
                 );
 
                 // re-acquire lock and save new image to shared state:
