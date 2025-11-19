@@ -39,6 +39,7 @@ raw-window-handle = "0.6.2" # Used to set parent for file prompts (freezes paren
 hayro = "0.4.0"
 hayro-syntax = "0.4.0"
 hayro-interpret = "0.4.0"
+hayro-svg = "0.2.0"
 kurbo = "0.12.0" # Used by hayro public API
 
 # Performance

@@ -8,12 +8,7 @@ use crate::assets::Assets;
 use crate::elm::{MsgSender, Update};
 use crate::prompt::{NoDisplayHandle, prompt_load_pdf_file};
 use crate::tabs::TabsView;
-use gpui::{
-    App, AppContext, Application, AsyncWindowContext, Context, Entity, FocusHandle,
-    ImageCacheError, ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit,
-    ParentElement, Pixels, Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled,
-    StyledImage, Task, WeakEntity, Window, WindowOptions, div, img, px, size,
-};
+use gpui::{App, AppContext, Application, AsyncWindowContext, Context, Entity, FocusHandle, ImageCacheError, ImageSource, InteractiveElement, IntoElement, KeyBinding, ObjectFit, ParentElement, Pixels, Render, RenderImage, Resource, ScrollHandle, SharedString, Size, Styled, StyledImage, Task, WeakEntity, Window, WindowOptions, div, img, px, size, Image, ImageFormat};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarState};
 use gpui_component::{Root, StyledExt, VirtualListScrollHandle, v_flex, v_virtual_list};
@@ -26,7 +21,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -767,6 +762,27 @@ impl Update<PdfCommand> for PdfReader {
     fn update(&mut self, window: &mut Window, cx: &mut Context<Self>, msg: PdfCommand) {
         match msg {
             PdfCommand::LoadedData(path, pdf_data) => {
+                if let Ok(pdf) = hayro::Pdf::new(Arc::new(pdf_data.clone())) {
+                    let start = Instant::now();
+                    let interpreter_settings = InterpreterSettings::default();
+
+                    for (_idx, page) in pdf.pages().iter().enumerate() {
+                        let svg = hayro_svg::convert(page, &interpreter_settings);
+                        if let Err(e) = Image::from_bytes(ImageFormat::Svg, svg.into_bytes()).to_image_data(cx.svg_renderer()) {
+                            log::error!("Failed to render SVG: {e}");
+                        }
+                    }
+
+                    let svg_total = start.elapsed();
+                    let start = Instant::now();
+
+                    for (_idx, page) in pdf.pages().iter().enumerate() {
+                        let _svg = pdf::rasterize_pdf_page(page, &interpreter_settings, &RenderSettings::default());
+                    }
+
+                    eprintln!("SVG Total:   \t {svg_total:?}");
+                    eprintln!("BITMAP Total:\t {:?}", start.elapsed());
+                }
                 if let Some(tab_data) = self.tabs.as_mut(cx).active_tab_data_mut() {
                     *tab_data = Some(PdfTabData {
                         path: Arc::new(path),
